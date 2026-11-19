@@ -1,0 +1,2 @@
+matplotlib        # pulls in numpy
+PyQt5             # only needed for tlist_gui.py
