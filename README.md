@@ -52,6 +52,36 @@ Main options (`analyse -h` for all):
 Data load in a background thread and are cached, so changing bins, ranges,
 gate or units re-plots instantly.
 
+## Training version (follows the lab manual)
+
+```sh
+~/.venvs/tlist/bin/python tlist_scanner.py
+```
+
+Same analysis, laid out like the original T-List Data Scanner so the
+existing lab manual can be followed step by step:
+
+1. **Search Directories**: *Add New Directory* adds the folder with status
+   *Stopped*. The green play icon starts processing, and new files are
+   re-scanned every *Search Frequency* seconds. The global play/stop buttons
+   act on all directories; right-click a row to remove it. *Move Files After
+   Scan* is shown but disabled, so files are never moved.
+2. **Scan Results**: one row per device acquisition (start / last found time,
+   source ECAL from the files, editable Target ECAL), plus the *Time
+   Calibration* range and bins. Click a **device name** to show its ungated
+   singles spectrum; hover to read channel, energy and counts.
+3. **Analysis**: choose two *Devices* and *Acq. Start*s, then the units:
+   * X = Energy/Channel, Y = Energy/Channel → energy-vs-energy matrix
+   * X = Delta Time (ns), Y = Counts → Δt histogram (t(dev 1) − t(dev 2))
+   * X = Energy/Channel, Y = Counts → coincident spectrum of device 1
+
+   *Graph* plots. Successive 1D graphs overlay until *Clear Graph*.
+   *Export Data* writes the old text format ("Coincident events" header).
+
+Target ECAL maps source energy to `offset + slope × E` before binning into
+[Energy Low, Energy High) with *# BINs*. Defaults 0 / 4000 / 200 / 0 / 1 leave
+the data unchanged. The coincidence window is the Time Range on Scan Results.
+
 ## File format notes
 
 The format was reverse-engineered from the files; details are in the
@@ -76,4 +106,5 @@ docstring of `tlist_core.py`. In short:
 * `tlist_core.py`: scanning, parsing, coincidence finding, histograms, CSV export
 * `tlist_plot.py`: matplotlib drawing shared by CLI and GUI
 * `tlist_cli.py`: command line
-* `tlist_gui.py`: PyQt5 GUI
+* `tlist_gui.py`: PyQt5 GUI (compact, all settings on one panel)
+* `tlist_scanner.py`: PyQt5 GUI matching the old scanner / lab manual

@@ -202,9 +202,7 @@ def pair_runs(runs: list[Run], dev_a: str, dev_b: str,
 # --------------------------------------------------------------------------
 # Event loading
 # --------------------------------------------------------------------------
-def _parse_file(path: str):
-    with open(path, "rb") as fh:
-        buf = fh.read()
+def _events_from_buf(buf: bytes) -> np.ndarray:
     i = buf.find(b"<list_data")
     if i < 0:
         return np.empty((0, 2), np.int64)
@@ -212,6 +210,53 @@ def _parse_file(path: str):
     if not pairs:
         return np.empty((0, 2), np.int64)
     return np.array(pairs, dtype=np.int64)
+
+
+def _parse_file(path: str):
+    with open(path, "rb") as fh:
+        return _events_from_buf(fh.read())
+
+
+_SPECTRUM = re.compile(rb"<spectrum\b[^>]*>")
+
+
+@dataclass
+class FileInfo:
+    """Everything needed from one .ava file (used for incremental scanning)."""
+    path: str
+    device: str
+    ip: str
+    mac: str
+    seq: int
+    start_ms: int
+    timebase_ns: float
+    ecal: tuple
+    elapsed_real_s: float       # acquisition real time at the end of this file
+    n_channels: int
+    raw: np.ndarray             # (n, 2) int64: raw time / data values incl. rollovers
+
+
+def read_file(path: str) -> FileInfo | None:
+    """Parse one .ava file completely. Returns None if it isn't a list-mode file."""
+    m = _FNAME.match(os.path.basename(path))
+    if not m:
+        return None
+    with open(path, "rb") as fh:
+        buf = fh.read()
+    attrs = _entry_attrs(buf)
+    if "start_time_ms" not in attrs:
+        return None
+    sm = _SPECTRUM.search(buf)
+    sattrs = {k.decode(): v.decode() for k, v in _ATTR.findall(sm.group(0))} if sm else {}
+    units = attrs.get("units", "nsec")
+    real = float(attrs.get("elapsed_real", 0))
+    real_s = real * 1e-6 if units == "nsec" else real   # entry real time is in µs
+    return FileInfo(
+        path=path, device=m["device"], ip=m["ip"], mac=m["mac"], seq=int(m["seq"]),
+        start_ms=int(attrs["start_time_ms"]), timebase_ns=float(attrs.get("timebase", 100)),
+        ecal=_energy_cal(buf) or (0.0, 1.0, 0.0), elapsed_real_s=real_s,
+        n_channels=int(sattrs.get("elapsed_comp_end_chan", 0) or 0),
+        raw=_events_from_buf(buf))
 
 
 def load_run(run: Run, progress=None) -> EventData:
@@ -225,7 +270,12 @@ def load_run(run: Run, progress=None) -> EventData:
         chunks.append(_parse_file(path))
         if progress and (k % 50 == 0 or k == n - 1):
             progress(k + 1, n)
-    raw = np.concatenate(chunks) if chunks else np.empty((0, 2), np.int64)
+    return events_from_raw(run, chunks)
+
+
+def events_from_raw(run: Run, chunks) -> EventData:
+    """Turn raw (time, data) chunks, in file-sequence order, into EventData."""
+    raw = np.concatenate(chunks) if len(chunks) else np.empty((0, 2), np.int64)
     t, d = raw[:, 0], raw[:, 1]
 
     is_roll = t >= ROLLOVER_FLAG
