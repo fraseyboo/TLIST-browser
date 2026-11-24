@@ -80,6 +80,10 @@ existing lab manual can be followed step by step:
    source ECAL from the files, editable Target ECAL), plus the *Time
    Calibration* range and bins. Click a **device name** to show its ungated
    singles spectrum; hover to read channel, energy and counts.
+   The optional **Coincidence Gate (ns)** (off by default; e.g. −800 to 0)
+   restricts Energy/Channel plots and Projections to pairs inside the gate,
+   while Delta Time plots keep the full Time Range and show the gate as
+   dashed lines. With it off, the Time Range is the coincidence window.
 3. **Analysis**: choose two *Devices* and *Acq. Start*s, then the units:
    * X = Energy/Channel, Y = Energy/Channel → energy-vs-energy matrix
    * X = Delta Time (ns), Y = Counts → Δt histogram (t(dev 1) − t(dev 2))

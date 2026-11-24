@@ -425,6 +425,24 @@ class ScanResultsTab(QtWidgets.QWidget):
         bar.addSpacing(20)
         bar.addWidget(QtWidgets.QLabel("Time BINs"))
         bar.addWidget(self.t_bins)
+        bar.addSpacing(30)
+        self.gate_on = QtWidgets.QCheckBox("Coincidence Gate (ns)")
+        self.gate_on.setToolTip(
+            "When ticked, Energy/Channel plots on Analysis (and Projections) only use pairs "
+            "with Gate low <= dt < Gate high. Delta Time plots still show the full Time "
+            "Range, with the gate drawn as dashed lines.")
+        self.g_lo = QtWidgets.QLineEdit("-800")
+        self.g_hi = QtWidgets.QLineEdit("0")
+        for w in (self.g_lo, self.g_hi):
+            w.setValidator(v)
+            w.setMaximumWidth(90)
+            w.setEnabled(False)
+        self.gate_on.toggled.connect(self.g_lo.setEnabled)
+        self.gate_on.toggled.connect(self.g_hi.setEnabled)
+        bar.addWidget(self.gate_on)
+        bar.addWidget(self.g_lo)
+        bar.addWidget(QtWidgets.QLabel("-"))
+        bar.addWidget(self.g_hi)
         bar.addStretch()
 
         # Two-level header: group labels above the column labels
@@ -501,6 +519,18 @@ class ScanResultsTab(QtWidgets.QWidget):
         if hi <= lo or n < 1:
             raise ValueError("Time Range high must be greater than low, BINs >= 1")
         return lo, hi, n
+
+    def gate_settings(self):
+        """(low, high) of the coincidence gate in ns, or None if not ticked."""
+        if not self.gate_on.isChecked():
+            return None
+        try:
+            lo, hi = float(self.g_lo.text()), float(self.g_hi.text())
+        except ValueError:
+            raise ValueError("Coincidence Gate values must be numbers")
+        if hi <= lo:
+            raise ValueError("Coincidence Gate high must be greater than low")
+        return lo, hi
 
     def refresh(self):
         acqs = self.store.sorted_acqs()
@@ -699,6 +729,7 @@ class AnalysisTab(QtWidgets.QWidget):
             return
         try:
             t_lo, t_hi, t_bins = self.scan_tab.time_settings()
+            gate = self.scan_tab.gate_settings()
         except ValueError as e:
             self.say(str(e), True)
             return
@@ -706,9 +737,17 @@ class AnalysisTab(QtWidgets.QWidget):
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
             ea, eb = self.store.events(acq[0]), self.store.events(acq[1])
-            i, j, dt = core.coincidence_pairs(ea.t_ns, eb.t_ns, t_lo, t_hi)
+            w_lo, w_hi = (min(t_lo, gate[0]), max(t_hi, gate[1])) if gate else (t_lo, t_hi)
+            i_all, j_all, dt_all = core.coincidence_pairs(ea.t_ns, eb.t_ns, w_lo, w_hi)
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
+        # Delta-time plots: the whole Time Range.  Energy/channel plots: the gate.
+        in_range = (dt_all >= t_lo) & (dt_all < t_hi)
+        g_lo, g_hi = gate if gate else (t_lo, t_hi)
+        in_gate = (dt_all >= g_lo) & (dt_all < g_hi)
+        dt = dt_all[in_range]
+        i, j = i_all[in_gate], j_all[in_gate]
+        gate_txt = f" (gate {g_lo:g} to {g_hi:g} ns)" if gate else ""
         da, db = acq[0].run.device, acq[1].run.device
         log = self.log.isChecked()
 
@@ -719,21 +758,26 @@ class AnalysisTab(QtWidgets.QWidget):
                 label = f"{da} - {db}"
                 xlabel = "Δ Time (ns)"
                 header = "deltaTime, counts"
+                plot_gate = gate
             else:
                 vals, edges = self._axis(acq[0], ea, xu)
                 counts, _ = np.histogram(vals[i], edges)
                 label = f"{da} (coincident with {db})"
                 xlabel = f"{xu.split(' ')[0]} {da}" + (" (keV)" if xu == UNIT_ENERGY else "")
                 header = f"{xu}, counts"
-            self.plot_1d(edges, counts, label, xlabel, log)
+                label += gate_txt
+                plot_gate = None
+            self.plot_1d(edges, counts, label, xlabel, log, plot_gate)
             self.last = ("1d", header, edges[:-1], counts)
-            self.say(f"{int(counts.sum()):,} coincident events plotted.")
+            self.say(f"{int(counts.sum()):,} coincident events plotted"
+                     f"{'' if xu == UNIT_DT else gate_txt}.")
             return
 
         # 2D: X = device 1 (or delta time), Y = device 2
         yv, yedges = self._axis(acq[1], eb, yu)
         if xu == UNIT_DT:
             xv, xedges = dt, np.linspace(t_lo, t_hi, t_bins + 1)
+            j = j_all[in_range]
             xlabel = "Δ Time (ns)"
             xcol = "deltaTime"
         else:
@@ -747,7 +791,8 @@ class AnalysisTab(QtWidgets.QWidget):
                  (" (keV)" if yu == UNIT_ENERGY else "")
         self.plot_2d(xedges, yedges, h, xlabel, ylabel, log)
         self.last = ("2d", f"{xcol}, {db}, counts", xedges[:-1], yedges[:-1], h.astype(np.int64))
-        self.say(f"{int(h.sum()):,} coincident events plotted.")
+        self.say(f"{int(h.sum()):,} coincident events plotted"
+                 f"{'' if xu == UNIT_DT else gate_txt}.")
 
         if xu != UNIT_DT:          # energy/channel matrix: hand it to the Projections tab
             t_edges = np.linspace(t_lo, t_hi, t_bins + 1)
@@ -756,7 +801,7 @@ class AnalysisTab(QtWidgets.QWidget):
                 units_a=self._core_units(xu), units_b=self._core_units(yu),
                 t_edges=t_edges, t_counts=np.histogram(dt, t_edges)[0],
                 ea_edges=xedges, eb_edges=yedges, ee_counts=h.astype(np.int64),
-                gate=(t_lo, t_hi), n_pairs=len(i), pair_a=xv, pair_b=yv[j])
+                gate=(g_lo, g_hi), n_pairs=len(i), pair_a=xv, pair_b=yv[j])
             self.matrix_ready.emit(res, log)
 
     @staticmethod
@@ -773,13 +818,16 @@ class AnalysisTab(QtWidgets.QWidget):
                                                  t["slope"] * c[1], t["slope"] * c[2]))
         return core.EventData(run, ev.t_ns, ev.channel)
 
-    def plot_1d(self, edges, counts, label, xlabel, log):
+    def plot_1d(self, edges, counts, label, xlabel, log, gate=None):
         if self.mode != "1d":
             self.fig.clear()
             self.ax = self.fig.add_subplot()
         ax = self.ax
         centres = 0.5 * (edges[:-1] + edges[1:])
-        ax.plot(centres, counts, "-o", ms=3.5, lw=1.8, label=label)
+        line, = ax.plot(centres, counts, "-o", ms=3.5, lw=1.8, label=label)
+        if gate:
+            for g in gate:
+                ax.axvline(g, color=line.get_color(), ls="--", lw=1)
         ax.set_xlabel(xlabel)
         ax.set_ylabel("Counts")
         ax.set_yscale("log" if log else "linear")
