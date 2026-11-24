@@ -342,6 +342,8 @@ class Result:
     ee_counts: np.ndarray       # shape (len(ea_edges)-1, len(eb_edges)-1)
     gate: tuple
     n_pairs: int
+    pair_a: np.ndarray = None   # A value of every pair in the gate (units_a)
+    pair_b: np.ndarray = None   # B value of the same pairs (units_b)
 
 
 def analyse(a: EventData, b: EventData, *,
@@ -373,7 +375,57 @@ def analyse(a: EventData, b: EventData, *,
     eb_edges = np.linspace(eb_range[0], eb_range[1], eb_bins + 1)
     ee, _, _ = np.histogram2d(xa, xb, bins=[ea_edges, eb_edges])
     return Result(a, b, units_a, units_b, t_edges, t_counts,
-                  ea_edges, eb_edges, ee.astype(np.int64), tuple(g), int(sel.sum()))
+                  ea_edges, eb_edges, ee.astype(np.int64), tuple(g), int(sel.sum()),
+                  pair_a=xa, pair_b=xb)
+
+
+def project(res: Result, gate_axis: str, lo: float, hi: float, edges=None):
+    """1D projection of the energy-energy data with a slice on one axis.
+
+    gate_axis 'a': keep pairs with lo <= A < hi and histogram their B values
+    (and vice versa for 'b'). The cut uses the exact pair values, not the 2D
+    bins. `edges` default to the projected axis' 2D binning.
+    Returns (edges, counts, n_pairs_in_gate).
+    """
+    g, other = (res.pair_a, res.pair_b) if gate_axis == "a" else (res.pair_b, res.pair_a)
+    if edges is None:
+        edges = res.eb_edges if gate_axis == "a" else res.ea_edges
+    sel = (g >= lo) & (g < hi)
+    counts, _ = np.histogram(other[sel], bins=edges)
+    return edges, counts, int(sel.sum())
+
+
+def channel_edges(run: Run, units: str, lo: float, hi: float, group: int = 1):
+    """Bin edges on channel boundaries (every `group` channels) covering [lo, hi].
+
+    Binning on channel boundaries avoids the comb pattern you get when a fixed
+    keV bin width holds alternately n and n+1 detector channels.
+    """
+    c = list(run.ecal) + [0.0, 0.0]
+    if units == "channel":
+        ch_lo, ch_hi = lo, hi
+    else:
+        def inv(e):     # channel for energy e (linear part; fine for small c2)
+            return (e - c[0]) / c[1] if c[1] else e
+        ch_lo, ch_hi = sorted((inv(lo), inv(hi)))
+    k0 = int(np.floor(ch_lo + 0.5))
+    k1 = int(np.ceil(ch_hi + 0.5))
+    b = np.arange(k0, k1 + group, group, dtype=np.float64) - 0.5
+    if units == "channel":
+        return b
+    e = c[0] + c[1] * b + c[2] * b * b
+    return e[(e >= lo - abs(c[1]) * group) & (e <= hi + abs(c[1]) * group)]
+
+
+def export_projection(path, res: Result, gate_axis, lo, hi, edges, counts):
+    ga, pa = (res.a, res.b) if gate_axis == "a" else (res.b, res.a)
+    ug, up = (res.units_a, res.units_b) if gate_axis == "a" else (res.units_b, res.units_a)
+    with open(path, "w") as fh:
+        fh.write(f"# Projection onto {pa.run.device} ({_ulabel(up)}), gate {lo:g} <= "
+                 f"{ga.run.device} < {hi:g} {_ulabel(ug)}; dt gate {res.gate[0]:g}..{res.gate[1]:g} ns\n")
+        fh.write(f"{pa.run.device}_low, {pa.run.device}_high, counts\n")
+        for l, h, c in zip(edges[:-1], edges[1:], counts):
+            fh.write(f"{l:g}, {h:g}, {c}\n")
 
 
 # --------------------------------------------------------------------------

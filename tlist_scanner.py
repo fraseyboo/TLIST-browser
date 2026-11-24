@@ -13,12 +13,15 @@ its lab manual, step by step:
                           singles spectrum, hover to read channel energies.
   Analysis            ->  pick two devices + acquisition starts, choose X/Y
                           units, Graph / Clear Graph / Export Data.
+  Projections (extra) ->  slice the last energy/channel matrix from Analysis
+                          on one device and project onto the other.
 
 Uses the same reader and coincidence code as tlist_cli.py / tlist_gui.py.
 
     python tlist_scanner.py
 """
 
+import dataclasses
 import os
 import sys
 import threading
@@ -34,6 +37,7 @@ from matplotlib.colors import LogNorm
 from matplotlib.figure import Figure
 
 import tlist_core as core
+from tlist_widgets import ProjectionTab
 
 UNIT_ENERGY, UNIT_CHANNEL, UNIT_DT, UNIT_COUNTS = (
     "Energy (keV)", "Channel", "Delta Time (ns)", "Counts")
@@ -561,6 +565,8 @@ class ScanResultsTab(QtWidgets.QWidget):
 # Tab 3: Analysis
 # ==========================================================================
 class AnalysisTab(QtWidgets.QWidget):
+    matrix_ready = QtCore.pyqtSignal(object, bool)     # core.Result, log scale
+
     def __init__(self, store: Store, scan_tab: ScanResultsTab):
         super().__init__()
         self.store = store
@@ -743,6 +749,30 @@ class AnalysisTab(QtWidgets.QWidget):
         self.last = ("2d", f"{xcol}, {db}, counts", xedges[:-1], yedges[:-1], h.astype(np.int64))
         self.say(f"{int(h.sum()):,} coincident events plotted.")
 
+        if xu != UNIT_DT:          # energy/channel matrix: hand it to the Projections tab
+            t_edges = np.linspace(t_lo, t_hi, t_bins + 1)
+            res = core.Result(
+                a=self._target_events(acq[0], ea), b=self._target_events(acq[1], eb),
+                units_a=self._core_units(xu), units_b=self._core_units(yu),
+                t_edges=t_edges, t_counts=np.histogram(dt, t_edges)[0],
+                ea_edges=xedges, eb_edges=yedges, ee_counts=h.astype(np.int64),
+                gate=(t_lo, t_hi), n_pairs=len(i), pair_a=xv, pair_b=yv[j])
+            self.matrix_ready.emit(res, log)
+
+    @staticmethod
+    def _core_units(u):
+        return "channel" if u == UNIT_CHANNEL else "energy"
+
+    @staticmethod
+    def _target_events(acq, ev):
+        """EventData whose calibration includes the Target ECAL offset/slope,
+        so projection bins land on this device's channel boundaries."""
+        t = acq.target
+        c = list(acq.run.ecal) + [0.0, 0.0, 0.0]
+        run = dataclasses.replace(acq.run, ecal=(t["offset"] + t["slope"] * c[0],
+                                                 t["slope"] * c[1], t["slope"] * c[2]))
+        return core.EventData(run, ev.t_ns, ev.channel)
+
     def plot_1d(self, edges, counts, label, xlabel, log):
         if self.mode != "1d":
             self.fig.clear()
@@ -798,6 +828,36 @@ class AnalysisTab(QtWidgets.QWidget):
 
 
 # ==========================================================================
+# Tab 4: Projections (extra section, after the steps in the manual)
+# ==========================================================================
+class ProjectionsSection(QtWidgets.QStackedWidget):
+    """Shows a hint until Analysis has produced an energy/channel matrix."""
+
+    def __init__(self, analysis: AnalysisTab, status):
+        super().__init__()
+        hint = QtWidgets.QLabel(
+            "<h3>Gamma-gamma projections</h3>"
+            "<p>On the <b>Analysis</b> tab, choose two devices and their Acq. Start, set "
+            "<b>X Units</b> and <b>Y Units</b> to <i>Energy (keV)</i> (or <i>Channel</i>) "
+            "and press <b>Graph</b>.</p>"
+            "<p>The matrix will then appear here. Choose which device to gate on and "
+            "use the <b>Centre</b> / <b>Width</b> sliders (or type <b>Low</b> / <b>High</b>, "
+            "e.g. 500 - 520 keV) to select a slice. The slice is shaded on the matrix and "
+            "the coincident spectrum in the other device is shown alongside.</p>")
+        hint.setWordWrap(True)
+        hint.setAlignment(QtCore.Qt.AlignCenter)
+        hint.setMargin(60)
+        self.proj = ProjectionTab(status)
+        self.addWidget(hint)
+        self.addWidget(self.proj)
+        analysis.matrix_ready.connect(self.show_result)
+
+    def show_result(self, res, log):
+        self.setCurrentWidget(self.proj)
+        self.proj.set_result(res, log)
+
+
+# ==========================================================================
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, directories=()):
         super().__init__()
@@ -811,6 +871,8 @@ class MainWindow(QtWidgets.QMainWindow):
         tabs.addTab(self.search, "Search Directories")
         tabs.addTab(self.results, "Scan Results")
         tabs.addTab(self.analysis, "Analysis")
+        self.projections = ProjectionsSection(self.analysis, self.statusBar().showMessage)
+        tabs.addTab(self.projections, "Projections")
         self.setCentralWidget(tabs)
         self.tabs = tabs
         for d in directories:

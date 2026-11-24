@@ -15,6 +15,7 @@ from matplotlib.figure import Figure
 
 import tlist_core as core
 import tlist_plot
+from tlist_widgets import ProjectionTab, _spin
 
 
 class Loader(QtCore.QThread):
@@ -42,17 +43,6 @@ class PlotTab(QtWidgets.QWidget):
         lay = QtWidgets.QVBoxLayout(self)
         lay.addWidget(NavigationToolbar2QT(self.canvas, self))
         lay.addWidget(self.canvas)
-
-
-def _spin(lo, hi, val, dec=0, step=1):
-    w = QtWidgets.QDoubleSpinBox() if dec else QtWidgets.QSpinBox()
-    if dec:
-        w.setDecimals(dec)
-    w.setRange(lo, hi)
-    w.setSingleStep(step)
-    w.setValue(val)
-    w.setKeyboardTracking(False)
-    return w
 
 
 class Main(QtWidgets.QMainWindow):
@@ -160,6 +150,8 @@ class Main(QtWidgets.QMainWindow):
         self.ee_tab, self.dt_tab = PlotTab(), PlotTab()
         self.tabs.addTab(self.ee_tab, "Energy vs Energy")
         self.tabs.addTab(self.dt_tab, "Delta time")
+        self.proj_tab = ProjectionTab(self.status)
+        self.tabs.addTab(self.proj_tab, "Projections")
 
         split = QtWidgets.QSplitter()
         split.addWidget(scroll)
@@ -293,6 +285,8 @@ class Main(QtWidgets.QMainWindow):
         f.clear()
         tlist_plot.draw_delta_time(f.add_subplot(), res, log=log)
         self.dt_tab.canvas.draw_idle()
+
+        self.proj_tab.set_result(res, log)
 
         txt = tlist_plot.summary(res).replace("\n", "<br>")
         if abs(ra.start_ms - rb.start_ms) > 10_000:

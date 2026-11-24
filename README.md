@@ -52,6 +52,16 @@ Main options (`analyse -h` for all):
 Data load in a background thread and are cached, so changing bins, ranges,
 gate or units re-plots instantly.
 
+**Projections tab**: slice the energy-energy matrix on one detector and see
+the coincident spectrum in the other, e.g. gate Osprey on 500–520 keV to see
+what Lynx records alongside a 511 keV hit. Choose which axis to gate, then set
+the slice with the centre/width sliders or type low/high (`[low, high)`).
+The slice is shaded on the 2D plot and the projection updates live. Cuts use
+each pair's exact energy, not the 2D bins. Projection bins follow the
+projected detector's channel boundaries (set *Channels / bin*), which avoids a
+comb pattern. The grey curve is the ungated projection for comparison.
+*Export projection…* writes a CSV.
+
 ## Training version (follows the lab manual)
 
 ```sh
@@ -77,6 +87,10 @@ existing lab manual can be followed step by step:
 
    *Graph* plots. Successive 1D graphs overlay until *Clear Graph*.
    *Export Data* writes the old text format ("Coincident events" header).
+4. **Projections** (extra, beyond the manual): picks up the last
+   Energy/Channel × Energy/Channel matrix graphed on Analysis (with the Time
+   Range and Target ECAL in force) and offers the same slice-and-project
+   controls as the main GUI's Projections tab.
 
 Target ECAL maps source energy to `offset + slope × E` before binning into
 [Energy Low, Energy High) with *# BINs*. Defaults 0 / 4000 / 200 / 0 / 1 leave
@@ -108,3 +122,4 @@ docstring of `tlist_core.py`. In short:
 * `tlist_cli.py`: command line
 * `tlist_gui.py`: PyQt5 GUI (compact, all settings on one panel)
 * `tlist_scanner.py`: PyQt5 GUI matching the old scanner / lab manual
+* `tlist_widgets.py`: the Projections widget shared by both GUIs
