@@ -4,6 +4,7 @@
     python tlist_gui.py [directory]
 """
 
+import html
 import os
 import sys
 
@@ -51,6 +52,7 @@ class Main(QtWidgets.QMainWindow):
         self.setWindowTitle("T-List Coincidence Analysis")
         self.resize(1400, 850)
         self.runs = []
+        self.skipped = []           # (path, reason) of unusable .ava files
         self.cache = {}             # run.key -> EventData
         self.result = None
         self.worker = None
@@ -103,7 +105,7 @@ class Main(QtWidgets.QMainWindow):
         form.addRow("Gate high", self.g_hi)
 
         # Energy settings per axis
-        self.units, self.e_lo, self.e_hi, self.e_bins = {}, {}, {}, {}
+        self.units, self.e_lo, self.e_hi, self.e_bins, self.e_width = {}, {}, {}, {}, {}
         for ab in "AB":
             form.addRow(QtWidgets.QLabel(f"<b>Axis {ab} ({'x' if ab == 'A' else 'y'})</b>"))
             u = QtWidgets.QComboBox()
@@ -112,10 +114,17 @@ class Main(QtWidgets.QMainWindow):
             self.e_lo[ab] = _spin(-1e6, 1e6, 0, 1, 10)
             self.e_hi[ab] = _spin(-1e6, 1e6, 4000, 1, 10)
             self.e_bins[ab] = _spin(1, 100000, 200)
+            w = self.e_width[ab] = _spin(0, 1e5, 0, 4, 0.5)
+            w.setSpecialValueText("auto (use Bins)")
+            w.setSuffix(" keV")
+            w.setToolTip("Histogram bin width. 0 = auto: Bins equal bins from Low to High.\n"
+                         "Otherwise the bins have this width and High is rounded up to fit.")
+            w.valueChanged.connect(lambda v, ab=ab: self.e_bins[ab].setEnabled(v == 0))
             form.addRow("Units", u)
             form.addRow("Low", self.e_lo[ab])
             form.addRow("High", self.e_hi[ab])
             form.addRow("Bins", self.e_bins[ab])
+            form.addRow("Bin width", w)
 
         self.log = QtWidgets.QCheckBox("Log scale")
         self.log.setChecked(True)
@@ -134,7 +143,8 @@ class Main(QtWidgets.QMainWindow):
 
         # Re-plot automatically on setting changes once data are loaded
         for w in [self.t_lo, self.t_hi, self.t_bins, self.offset, self.g_lo, self.g_hi,
-                  *self.e_lo.values(), *self.e_hi.values(), *self.e_bins.values()]:
+                  *self.e_lo.values(), *self.e_hi.values(), *self.e_bins.values(),
+                  *self.e_width.values()]:
             w.valueChanged.connect(self.replot_if_loaded)
         for w in [self.gate_on, self.log]:
             w.toggled.connect(self.replot_if_loaded)
@@ -197,10 +207,12 @@ class Main(QtWidgets.QMainWindow):
 
         def job(progress, d):
             progress(f"Scanning {d} …")
-            return core.scan_directory(d)
+            skipped = []
+            return core.scan_directory(d, skipped), skipped
         self.start(job, (d,), self.scanned)
 
-    def scanned(self, runs):
+    def scanned(self, out):
+        runs, self.skipped = out
         self.runs, self.cache, self.result = runs, {}, None
         devs = core.devices(runs)
         for i, ab in enumerate("AB"):
@@ -213,7 +225,28 @@ class Main(QtWidgets.QMainWindow):
             self.fill_runs(ab)
         self.singles_tab.data = {}
         self.offer_singles()
-        self.status(f"Found {len(runs)} acquisitions from {len(devs)} devices")
+        msg = f"Found {len(runs)} acquisitions from {len(devs)} devices"
+        warnings = core.scan_warnings(runs, self.skipped)
+        self.info.setText(self.warning_html(warnings))
+        if warnings:
+            msg += f" - {len(warnings)} warning(s)"
+        # Pop up only for skipped files or problems with the pair selected by default
+        # (an old fragmentary run in the folder shouldn't nag on every scan)
+        sel = [r for r in (self.run_box["A"].currentData(), self.run_box["B"].currentData()) if r]
+        urgent = core.scan_warnings(runs, self.skipped, only=sel)
+        if urgent:
+            box = QtWidgets.QMessageBox(QtWidgets.QMessageBox.Warning, "Data may be incomplete",
+                                        "Some data in this directory can't be used or looks "
+                                        "incomplete. Check that every file was copied.", parent=self)
+            box.setInformativeText("\n".join("• " + w for w in urgent[:6])
+                                   + ("\n…" if len(urgent) > 6 else ""))
+            box.setDetailedText("\n\n".join(urgent))
+            box.open()
+        self.status(msg)
+
+    @staticmethod
+    def warning_html(warnings):
+        return "".join(f"<font color='red'>⚠ {html.escape(w)}</font><br>" for w in warnings)
 
     def fill_runs(self, ab):
         box = self.run_box[ab]
@@ -268,7 +301,26 @@ class Main(QtWidgets.QMainWindow):
             self.start(job, (need,), loaded)
 
     def units_changed(self):
+        for ab, u in self.units.items():
+            self.e_width[ab].setSuffix(" keV" if u.currentText() == "energy" else " ch")
         self.replot_if_loaded()
+
+    def axis_binning(self, ab, run):
+        """((lo, hi), bins) for an energy axis, honouring the Bin width field,
+        plus a stripes warning ('' if none)."""
+        lo, hi = self.e_lo[ab].value(), self.e_hi[ab].value()
+        width = self.e_width[ab].value()
+        energy = self.units[ab].currentText() == "energy"
+        if width > 0:
+            if not energy:
+                width = max(1, round(width))
+            edges = core.edges_for_width(lo, hi, width)
+            rng, bins = (lo, float(edges[-1])), len(edges) - 1
+        else:
+            rng, bins = (lo, hi), self.e_bins[ab].value()
+        note = (core.comb_note(run.device, (rng[1] - rng[0]) / bins, run.ecal[1])
+                if energy else "")
+        return rng, bins, note
 
     def graph(self):
         ra, rb = self.run_box["A"].currentData(), self.run_box["B"].currentData()
@@ -287,11 +339,17 @@ class Main(QtWidgets.QMainWindow):
             self.status("Time range high must exceed low")
             return
         gate = (self.g_lo.value(), self.g_hi.value()) if self.gate_on.isChecked() else None
+        try:
+            ea_range, ea_bins, note_a = self.axis_binning("A", ra)
+            eb_range, eb_bins, note_b = self.axis_binning("B", rb)
+        except ValueError as e:
+            self.status(str(e))
+            return
         self.result = res = core.analyse(
             self.cache[ra.key], self.cache[rb.key],
             t_range=(self.t_lo.value(), self.t_hi.value()), t_bins=self.t_bins.value(),
-            ea_range=(self.e_lo["A"].value(), self.e_hi["A"].value()), ea_bins=self.e_bins["A"].value(),
-            eb_range=(self.e_lo["B"].value(), self.e_hi["B"].value()), eb_bins=self.e_bins["B"].value(),
+            ea_range=ea_range, ea_bins=ea_bins,
+            eb_range=eb_range, eb_bins=eb_bins,
             units_a=self.units["A"].currentText(), units_b=self.units["B"].currentText(),
             gate=gate, offset_ns=self.offset.value())
         log = self.log.isChecked()
@@ -313,6 +371,12 @@ class Main(QtWidgets.QMainWindow):
         txt = tlist_plot.summary(res).replace("\n", "<br>")
         if abs(ra.start_ms - rb.start_ms) > 10_000:
             txt += "<br><font color='red'>Runs started &gt;10 s apart</font>"
+        for note in (note_a, note_b):
+            if note:
+                txt += f"<br><font color='#d9534f'>{html.escape(note)}</font>"
+        warnings = core.scan_warnings(self.runs, self.skipped, only=[ra, rb])
+        if warnings:
+            txt += "<br>" + self.warning_html(warnings)
         self.info.setText(txt)
         self.status(f"{int(res.t_counts.sum()):,} pairs in Δt window, "
                     f"{int(res.ee_counts.sum()):,} in energy plot")

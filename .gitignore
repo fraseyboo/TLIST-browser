@@ -1,4 +1,4 @@
-/data
 *.pyc
-/dataagain
-broken data from broken men/
+hidden/*
+.DS_Store
+__pycache__

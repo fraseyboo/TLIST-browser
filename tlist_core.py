@@ -65,6 +65,15 @@ class Run:
     files: list = field(default_factory=list)      # [(seq, path)]
     timebase_ns: float = 100.0
     ecal: tuple = (0.0, 1.0, 0.0)
+    real_by_seq: dict = field(default_factory=dict, repr=False)   # seq -> elapsed real (s)
+
+    @property
+    def first_real_s(self) -> float:
+        return self.real_by_seq[min(self.real_by_seq)] if self.real_by_seq else 0.0
+
+    @property
+    def last_real_s(self) -> float:
+        return self.real_by_seq[max(self.real_by_seq)] if self.real_by_seq else 0.0
 
     @property
     def key(self) -> str:
@@ -126,19 +135,53 @@ def _energy_cal(buf: bytes):
     return None
 
 
-def scan_directory(directory: str) -> list[Run]:
-    """Find all runs in a directory. Reads each file's <entry> header only."""
+def _real_s(attrs: dict) -> float:
+    """Elapsed real time of the acquisition at the end of a file, in seconds."""
+    real = float(attrs.get("elapsed_real", 0) or 0)
+    return real * 1e-6 if attrs.get("units", "nsec") == "nsec" else real  # entry real is in µs
+
+
+# Reasons a .ava file can't be used (see skip_reason)
+SKIP_INCOMPLETE = "incomplete file (still being written, or a broken copy)"
+SKIP_NOT_PROSPECT = "not a Prospect .ava file"
+SKIP_SPECTRUM = "spectrum only: no list-mode (T-List) event data"
+SKIP_RENAMED = ("list-mode file that has been renamed: the device, run and file order are "
+                "read from Prospect's original name (Device<IP>_<MAC>_<start>_<time>_<seq>.ava)")
+
+
+def skip_reason(name: str, buf: bytes) -> str | None:
+    """Why a .ava file can't be used for coincidence analysis (None if it can)."""
+    if b"<mcadata" not in buf[:500]:
+        return SKIP_NOT_PROSPECT
+    if b"</mcadata>" not in buf[-200:]:
+        return SKIP_INCOMPLETE
+    if "start_time_ms" not in _entry_attrs(buf):
+        return SKIP_SPECTRUM
+    if not _FNAME.match(name):
+        return SKIP_RENAMED
+    return None
+
+
+def scan_directory(directory: str, skipped: list | None = None) -> list[Run]:
+    """Find all runs in a directory.
+
+    skipped: optional list; (path, reason) is appended for every .ava file
+    that can't be used (see skip_reason).
+    """
     runs: dict[tuple, Run] = {}
     for name in os.listdir(directory):
         m = _FNAME.match(name)
-        if not m:
+        if not m and not name.lower().endswith(".ava"):
             continue
         path = os.path.join(directory, name)
         with open(path, "rb") as fh:
             buf = fh.read()
-        attrs = _entry_attrs(buf)
-        if "start_time_ms" not in attrs:
+        reason = skip_reason(name, buf)
+        if reason:
+            if skipped is not None:
+                skipped.append((path, reason))
             continue
+        attrs = _entry_attrs(buf)
         start_ms = int(attrs["start_time_ms"])
         k = (m["device"], m["ip"], start_ms)
         run = runs.get(k)
@@ -149,9 +192,68 @@ def scan_directory(directory: str) -> list[Run]:
             if cal:
                 run.ecal = cal
         run.files.append((int(m["seq"]), path))
+        run.real_by_seq[int(m["seq"])] = _real_s(attrs)
     out = sorted(runs.values(), key=lambda r: (r.device, r.start_ms))
     for r in out:
         r.files.sort()
+    return out
+
+
+# --------------------------------------------------------------------------
+# Completeness checks (catch partially copied data folders)
+# --------------------------------------------------------------------------
+LATE_START_S = 2.0          # first file already this far into the acquisition
+PAIR_WINDOW_MS = 10_000     # runs of two devices started this close = same acquisition
+
+
+def run_problems(run: Run, runs: list[Run]) -> list[str]:
+    """Signs that files of `run` are missing. `runs` = all runs found (for
+    comparing with the other device's run of the same acquisition)."""
+    out = []
+    seqs = sorted(s for s, _ in run.files)
+    missing = (seqs[-1] - seqs[0] + 1) - len(seqs) if seqs else 0
+    if missing:
+        gaps, prev = [], seqs[0]
+        for s in seqs[1:]:
+            if s > prev + 1:
+                gaps.append(f"{prev + 1}" if s == prev + 2 else f"{prev + 1}-{s - 1}")
+            prev = s
+        shown = ", ".join(gaps[:5]) + (", …" if len(gaps) > 5 else "")
+        out.append(f"{missing} file(s) missing from the middle (file numbers {shown})")
+    if run.first_real_s > LATE_START_S:
+        out.append(f"first file is {run.first_real_s:.1f} s into the acquisition: "
+                   "the files from the start are missing")
+    partners = [r for r in runs if r.device != run.device
+                and abs(r.start_ms - run.start_ms) <= PAIR_WINDOW_MS]
+    if not partners:
+        out.append("no run from another device started at the same time "
+                   "(the other detector's files may not have been copied)")
+    for p in partners:
+        short = p.last_real_s - run.last_real_s
+        if short > max(2.0, 0.05 * p.last_real_s):
+            out.append(f"ends {short:.1f} s before {p.device} "
+                       f"({run.last_real_s:.1f} s vs {p.last_real_s:.1f} s): "
+                       "the files from the end are missing")
+    return out
+
+
+def scan_warnings(runs: list[Run], skipped=(), only=None) -> list[str]:
+    """Human-readable warnings about skipped files and incomplete runs.
+
+    only: restrict the run checks to these runs (e.g. the two selected).
+    """
+    out = []
+    by_reason: dict[str, list[str]] = {}
+    for path, reason in skipped:
+        by_reason.setdefault(reason, []).append(os.path.basename(path))
+    for reason, names in by_reason.items():
+        shown = ", ".join(sorted(names)[:4]) + (", …" if len(names) > 4 else "")
+        out.append(f"{len(names)} file(s) skipped, {reason}: {shown}")
+    if skipped and not runs:
+        out.append("No usable list-mode data found. Copy the whole Prospect output folder "
+                   "without renaming the files.")
+    for r in (only if only is not None else runs):
+        out += [f"{r.device} run {r.start_str}: {p}" for p in run_problems(r, runs)]
     return out
 
 
@@ -236,21 +338,23 @@ class FileInfo:
     raw: np.ndarray             # (n, 2) int64: raw time / data values incl. rollovers
 
 
-def read_file(path: str) -> FileInfo | None:
-    """Parse one .ava file completely. Returns None if it isn't a list-mode file."""
-    m = _FNAME.match(os.path.basename(path))
-    if not m:
-        return None
+class SkippedFile(Exception):
+    """Raised by read_file for a file that can't be used; str() is the reason."""
+
+
+def read_file(path: str) -> FileInfo:
+    """Parse one .ava file completely. Raises SkippedFile if it can't be used."""
+    name = os.path.basename(path)
     with open(path, "rb") as fh:
         buf = fh.read()
+    reason = skip_reason(name, buf)
+    if reason:
+        raise SkippedFile(reason)
+    m = _FNAME.match(name)
     attrs = _entry_attrs(buf)
-    if "start_time_ms" not in attrs:
-        return None
     sm = _SPECTRUM.search(buf)
     sattrs = {k.decode(): v.decode() for k, v in _ATTR.findall(sm.group(0))} if sm else {}
-    units = attrs.get("units", "nsec")
-    real = float(attrs.get("elapsed_real", 0))
-    real_s = real * 1e-6 if units == "nsec" else real   # entry real time is in µs
+    real_s = _real_s(attrs)
     return FileInfo(
         path=path, device=m["device"], ip=m["ip"], mac=m["mac"], seq=int(m["seq"]),
         start_ms=int(attrs["start_time_ms"]), timebase_ns=float(attrs.get("timebase", 100)),
@@ -467,6 +571,65 @@ def export_projection(path, res: Result, gate_axis, lo, hi, edges, counts):
         fh.write(f"{pa.run.device}_low, {pa.run.device}_high, counts\n")
         for l, h, c in zip(edges[:-1], edges[1:], counts):
             fh.write(f"{l:g}, {h:g}, {c}\n")
+
+
+# --------------------------------------------------------------------------
+# Binning and calibration helpers
+# --------------------------------------------------------------------------
+def edges_for_width(lo, hi, width, max_bins=20000) -> np.ndarray:
+    """Bin edges of `width` from lo, the last edge rounded up past hi."""
+    if not width > 0:
+        raise ValueError("Bin width must be greater than zero")
+    n = max(1, int(np.ceil((hi - lo) / width - 1e-9)))
+    if n > max_bins:
+        raise ValueError(f"Bin width {width:g} gives {n:,} bins (max {max_bins:,}); "
+                         "use a larger width")
+    return lo + width * np.arange(n + 1)
+
+
+def comb_note(device, bin_kev, kev_per_ch) -> str:
+    """Warning text if energy bins aren't a whole number of ADC channels
+    (alternate bins then hold one channel more or less, giving stripes)."""
+    kev_per_ch = abs(kev_per_ch)
+    ratio = bin_kev / kev_per_ch if kev_per_ch else 0
+    if ratio < 0.5 or ratio > 20 or abs(ratio - round(ratio)) < 0.05:
+        return ""
+    return (f"{device}: {bin_kev:.4g} keV bins = {ratio:.2f} channels, expect stripes. "
+            f"Try a multiple of {kev_per_ch:.4g} keV (e.g. {kev_per_ch * max(1, round(ratio)):.4g}).")
+
+
+def find_peaks(counts, max_peaks=8) -> list[float]:
+    """Centroids (in channels) of the most prominent peaks of a spectrum."""
+    counts = np.asarray(counts, dtype=float)
+    n = len(counts)
+    k = max(2, n // 1600)                          # ~peak half-width in channels
+    if n < 8 * k:
+        return []
+    smooth = np.convolve(counts, np.ones(2 * k + 1) / (2 * k + 1), "same")
+    found = []
+    for i in range(4 * k, n - 4 * k):
+        win = smooth[i - 2 * k:i + 2 * k + 1]
+        if smooth[i] < win.max() or smooth[i] == smooth[i - 1]:
+            continue
+        bg = np.median(smooth[max(0, i - 20 * k):i + 20 * k + 1])
+        net = smooth[i] - bg
+        if net < 5 or net < 4 * np.sqrt(bg + 1):
+            continue
+        x = np.arange(i - 2 * k, i + 2 * k + 1)
+        y = np.clip(counts[x] - min(counts[x[0]], counts[x[-1]]), 0, None)
+        if y.sum() > 0:
+            found.append((net * k, float((x * y).sum() / y.sum())))
+    found.sort(reverse=True)
+    return sorted(c for _, c in found[:max_peaks])
+
+
+def fit_linear(channels, energies):
+    """Least-squares E = a + b*ch. Returns (a, b, residuals in keV)."""
+    ch, e = np.asarray(channels, float), np.asarray(energies, float)
+    if len(ch) < 2 or np.ptp(ch) == 0:
+        raise ValueError("Need at least two peaks at different channels")
+    b, a = np.polyfit(ch, e, 1)
+    return float(a), float(b), (a + b * ch - e)
 
 
 # --------------------------------------------------------------------------

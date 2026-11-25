@@ -52,6 +52,12 @@ Main options (`analyse -h` for all):
 Data load in a background thread and are cached, so changing bins, ranges,
 gate or units re-plots instantly.
 
+Each axis has a **Bin width** field (keV, or channels in channel units).
+0 means auto: *Bins* equal bins from Low to High. Otherwise the bins have this
+width and High is rounded up to fit. A red note in the side panel appears when
+an energy bin isn't a whole number of ADC channels, because uneven bins show up
+as stripes.
+
 **Projections tab**: slice the energy-energy matrix on one detector and see
 the coincident spectrum in the other, e.g. gate Osprey on 500–520 keV to see
 what Lynx records alongside a 511 keV hit. Choose which axis to gate, then set
@@ -102,6 +108,22 @@ existing lab manual can be followed step by step:
 
    *Graph* plots. Successive 1D graphs overlay until *Clear Graph*.
    *Export Data* writes the old text format ("Coincident events" header).
+   The optional **X/Y Bin Width** fields set the histogram bin width for
+   each axis, in that axis's units (keV, channels or ns). Leave them blank to
+   use the Bins from Scan Results. A red note appears when an energy bin isn't
+   a whole number of ADC channels, because uneven bins show up as stripes. Use
+   a multiple of the keV-per-channel value given in the note.
+
+   **Recalibrate…** (on Scan Results, after clicking a device name) corrects a
+   bad energy calibration. *Find Peaks* lists the strongest peaks' channels.
+   Type the known energy next to the peaks you recognise and press *Fit*, or
+   type the new calibration directly. *Apply* sets that device's Target ECAL
+   Offset/Slope so that the energies used match the new calibration. The
+   change can apply to every acquisition with the same file calibration.
+   *Reset to File Calibration* undoes it. The spectrum shows the energies in
+   use. An energy/channel matrix on Analysis redraws automatically when a
+   plotted device's Target ECAL changes. 1D plots overlay, so they show a
+   reminder to *Clear Graph* and *Graph* again instead.
 4. **Projections** (extra, beyond the manual): picks up the last
    Energy/Channel × Energy/Channel matrix graphed on Analysis (with the Time
    Range and Target ECAL in force) and offers the same slice-and-project
@@ -129,6 +151,23 @@ docstring of `tlist_core.py`. In short:
 * Energy = default polynomial from `<calibration_details type="energy">`.
 * All windows and bins are half-open, `[lo, hi)`. Keep the Δt bin width a
   multiple of 100 ns, or the histogram shows a comb pattern.
+
+## Missing or unusable files
+
+All three programs check each data folder and warn when files look missing or
+unusable. The CLI prints the warnings to stderr. The GUI shows a popup and lists
+them in the side panel. The training version lists them in a red box on Search
+Directories and under the plot on Analysis.
+
+| Warning | Usual cause |
+|---|---|
+| *spectrum only: no list-mode (T-List) event data* | The file was saved with Save Spectrum, so it has a spectrum but no pulse timestamps. Coincidence analysis needs list-mode files. |
+| *list-mode file that has been renamed* | The device, run and file order are read from Prospect's original filename, so keep the original names. |
+| *incomplete file* | The file is still being written or was copied badly (it has no closing `</mcadata>` tag). |
+| *N file(s) missing from the middle* | There are gaps in the file sequence numbers of a run. |
+| *first file is X s into the acquisition* | The files from the start of the run weren't copied. |
+| *ends X s before …* | One detector's run stops early, so its last files weren't copied. |
+| *no run from another device started at the same time* | The other detector's files weren't copied. |
 
 ## Files
 

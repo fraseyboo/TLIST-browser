@@ -15,29 +15,40 @@ import time
 import tlist_core as core
 
 
+def warn(lines):
+    for w in lines:
+        print(f"warning: {w}", file=sys.stderr)
+
+
 def cmd_list(args):
     t0 = time.perf_counter()
-    runs = core.scan_directory(args.directory)
+    skipped = []
+    runs = core.scan_directory(args.directory, skipped)
     if not runs:
-        print(f"No .ava files found in {args.directory}")
+        print(f"No usable list-mode .ava files found in {args.directory}")
+        warn(core.scan_warnings(runs, skipped))
         return 1
     print(f"{'Device':<12}{'IP':<17}{'Start (UTC)':<22}{'Files':>7}  ECAL (c0, c1, c2)")
     for r in runs:
         cal = ", ".join(f"{c:.6g}" for c in r.ecal)
         print(f"{r.device:<12}{r.ip:<17}{r.start_str:<22}{len(r.files):>7}  {cal}")
     print(f"\n({len(runs)} runs, scanned in {time.perf_counter() - t0:.2f} s)")
+    warn(core.scan_warnings(runs, skipped))
     return 0
 
 
 def cmd_analyse(args):
     t0 = time.perf_counter()
-    runs = core.scan_directory(args.directory)
+    skipped = []
+    runs = core.scan_directory(args.directory, skipped)
     try:
         ra, rb = core.pair_runs(runs, args.a, args.b, args.start_a, args.start_b)
     except LookupError as e:
         print(f"error: {e}", file=sys.stderr)
+        warn(core.scan_warnings(runs, skipped))
         return 2
     print(f"A = {ra}\nB = {rb}")
+    warn(core.scan_warnings(runs, skipped, only=[ra, rb]))
     if abs(ra.start_ms - rb.start_ms) > 10_000:
         print("warning: runs started more than 10 s apart - probably not the same acquisition",
               file=sys.stderr)

@@ -22,6 +22,7 @@ Uses the same reader and coincidence code as tlist_cli.py / tlist_gui.py.
 """
 
 import dataclasses
+import html
 import os
 import sys
 import threading
@@ -38,6 +39,8 @@ from matplotlib.figure import Figure
 
 import tlist_core as core
 from tlist_widgets import ProjectionTab
+
+LOW_E_CHECK_KEV = 100.0      # Scan Results spectrum warns if nothing is below this energy
 
 UNIT_ENERGY, UNIT_CHANNEL, UNIT_DT, UNIT_COUNTS = (
     "Energy (keV)", "Channel", "Delta Time (ns)", "Counts")
@@ -89,9 +92,17 @@ class Acquisition:
     def add(self, info: core.FileInfo):
         self.chunks[info.seq] = info.raw
         self.run.files.append((info.seq, info.path))
+        self.run.real_by_seq[info.seq] = info.elapsed_real_s
         self.last_real_s = max(self.last_real_s, info.elapsed_real_s)
         self.n_channels = max(self.n_channels, info.n_channels)
         self.version += 1
+
+    @property
+    def effective_ecal(self):
+        """File ECAL with the Target Offset/Slope folded in."""
+        o, s = self.target["offset"], self.target["slope"]
+        c = list(self.run.ecal) + [0.0, 0.0, 0.0]
+        return (o + s * c[0], s * c[1], s * c[2])
 
     @property
     def last_found_ms(self):
@@ -106,6 +117,7 @@ class Store(QtCore.QObject):
         self.lock = threading.RLock()
         self.acqs = {}              # (device, ip, start_ms) -> Acquisition
         self.seen = set()           # file paths already processed
+        self.skipped = {}           # path -> reason the file can't be used
         self._events = {}           # key -> (version, EventData)
 
     def add_file(self, info):
@@ -115,6 +127,15 @@ class Store(QtCore.QObject):
             if acq is None:
                 acq = self.acqs[k] = Acquisition(info)
             acq.add(info)
+
+    def warnings(self, only=None) -> list[str]:
+        """Skipped files and signs of missing files (core.scan_warnings).
+        only: acquisitions to check (default all)."""
+        with self.lock:
+            runs = [a.run for a in self.acqs.values()]
+            sel = None if only is None else [a.run for a in only]
+            skipped = list(self.skipped.items()) if only is None else []
+            return core.scan_warnings(runs, skipped, sel)
 
     def sorted_acqs(self):
         with self.lock:
@@ -179,12 +200,17 @@ class DirectoryScanner(QtCore.QThread):
                     break
                 try:
                     info = core.read_file(p)
-                except Exception:       # partially written file: try again next scan
+                except core.SkippedFile as e:
+                    self.store.skipped[p] = str(e)
+                    if str(e) != core.SKIP_INCOMPLETE:  # incomplete: try again next scan
+                        self.store.seen.add(p)
                     continue
+                except Exception:       # unreadable right now: try again next scan
+                    continue
+                self.store.skipped.pop(p, None)
                 self.store.seen.add(p)
-                if info is not None:
-                    self.store.add_file(info)
-                    self.n_files += 1
+                self.store.add_file(info)
+                self.n_files += 1
                 if time.monotonic() - t_emit > 0.5:
                     self.progress = f"{k + 1}/{len(new)} new files"
                     self.status.emit(self)
@@ -258,9 +284,26 @@ class SearchTab(QtWidgets.QWidget):
         self.table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.context_menu)
 
+        self.warn = QtWidgets.QLabel()
+        self.warn.setWordWrap(True)
+        self.warn.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.warn.setStyleSheet("QLabel { border: 1px solid #d9534f; border-radius: 4px; "
+                                "padding: 6px; color: #d9534f; }")
+        self.warn.hide()
+        store.changed.connect(self.update_warnings)
+
         lay = QtWidgets.QVBoxLayout(self)
         lay.addLayout(bar)
         lay.addWidget(self.table)
+        lay.addWidget(self.warn)
+
+    def update_warnings(self):
+        warnings = self.store.warnings()
+        text = "".join(f"⚠ {html.escape(w)}<br>" for w in warnings)
+        if text != self.warn.text():
+            self.warn.setText("<b>Data may be incomplete – check that every file was "
+                              "copied:</b><br>" + text if warnings else "")
+            self.warn.setVisible(bool(warnings))
 
     def add_directory(self):
         dlg = QtWidgets.QFileDialog(self, "Select the data directory")
@@ -360,7 +403,18 @@ class SpectrumCanvas(FigureCanvasQTAgg):
         ax = self.ax
         ax.clear()
         ax.stairs(counts, e, fill=True, color="#1565ff")
-        ax.set_xlim(max(e[0], 0), e[-1])
+        ax.set_xlim(0, max(e[-1], 1))      # always from 0 keV: an offset calibration shows as a gap
+        centres = 0.5 * (e[:-1] + e[1:])
+        if not counts.sum():
+            warn = "⚠ No events recorded in this acquisition"
+        elif not counts[centres < LOW_E_CHECK_KEV].sum():
+            warn = f"⚠ No counts below {LOW_E_CHECK_KEV:g} keV: check the energy calibration"
+        else:
+            warn = None
+        if warn:
+            ax.text(0.01, 0.95, warn, transform=ax.transAxes, ha="left",
+                    va="top", fontsize=10, color="#d9534f",
+                    bbox=dict(facecolor="white", edgecolor="#d9534f", alpha=0.9))
         ax.set_ylim(0, max(counts.max() * 1.05, 1))
         ax.set_xlabel("Energy (keV)")
         ax.set_ylabel("Counts")
@@ -394,6 +448,7 @@ class SpectrumCanvas(FigureCanvasQTAgg):
 
 
 class ScanResultsTab(QtWidgets.QWidget):
+    target_changed = QtCore.pyqtSignal(object)      # [Acquisition] whose Target ECAL changed
     COLS = ["Device Name", "Start Run Time", "Last Found Time",
             "Offset", "Slope", "Quadratic",
             "Energy Low (keV)", "Energy High (keV)", "# BINs", "Offset", "Slope"]
@@ -480,6 +535,11 @@ class ScanResultsTab(QtWidgets.QWidget):
         self.export_btn.setToolTip("Save the displayed spectrum: channel, energy, counts")
         self.export_btn.setEnabled(False)
         self.export_btn.clicked.connect(self.export_spectrum)
+        self.recal_btn = QtWidgets.QPushButton("Recalibrate…")
+        self.recal_btn.setToolTip("Correct this device's energy calibration (sets the Target "
+                                  "ECAL Offset/Slope) from known peaks or typed coefficients")
+        self.recal_btn.setEnabled(False)
+        self.recal_btn.clicked.connect(self.recalibrate)
 
         top = QtWidgets.QWidget()
         tl = QtWidgets.QVBoxLayout(top)
@@ -492,6 +552,7 @@ class ScanResultsTab(QtWidgets.QWidget):
         bl.setContentsMargins(0, 0, 0, 0)
         hint_row = QtWidgets.QHBoxLayout()
         hint_row.addWidget(self.hint, 1)
+        hint_row.addWidget(self.recal_btn)
         hint_row.addWidget(self.export_btn)
         bl.addLayout(hint_row)
         bl.addWidget(NavigationToolbar2QT(self.spectrum, self))
@@ -582,10 +643,16 @@ class ScanResultsTab(QtWidgets.QWidget):
             val = int(item.text()) if key == "bins" else float(item.text())
             if key == "bins" and val < 1:
                 raise ValueError
+            changed = acq.target[key] != val
             acq.target[key] = val
         except ValueError:
             QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), "Please enter a number")
+            changed = False
         self.refresh()
+        if changed:
+            if self.shown is not None and self.shown[0] is acq:     # redraw the spectrum
+                self.spectrum.show_spectrum(acq.run.device, self.shown[1], acq.effective_ecal)
+            self.target_changed.emit([acq])
 
     def row_clicked(self, r, c):
         if c != 0:
@@ -596,9 +663,30 @@ class ScanResultsTab(QtWidgets.QWidget):
         counts = np.bincount(ev.channel, minlength=n)[:n]
         self.hint.setText(f"{acq.run.device}  (start {fmt_time(acq.run.start_ms)}): "
                           f"{len(ev.t_ns):,} events, {n} channels")
-        self.spectrum.show_spectrum(acq.run.device, counts, acq.run.ecal)
+        self.spectrum.show_spectrum(acq.run.device, counts, acq.effective_ecal)
         self.shown = (acq, counts)
         self.export_btn.setEnabled(True)
+        self.recal_btn.setEnabled(True)
+
+    def recalibrate(self):
+        if self.shown is None:
+            return
+        acq, counts = self.shown
+        same = [a for a in self.store.sorted_acqs()
+                if a.run.device == acq.run.device and a.run.ecal == acq.run.ecal]
+        dlg = RecalibrateDialog(acq, counts, len(same), self)
+        if not dlg.exec_():
+            return
+        changed = same if dlg.apply_all.isChecked() else [acq]
+        for a in changed:
+            a.target.update(dlg.target_for(a))
+        self.refresh()
+        self.target_changed.emit(changed)
+        r = self.rows.index(acq)
+        self.row_clicked(r, 0)
+        self.hint.setText(self.hint.text() + "  -  recalibrated: E = "
+                          + " + ".join(f"{c:.5g}" + ("·ch" if k == 1 else "·ch²" if k == 2 else "")
+                                       for k, c in enumerate(acq.effective_ecal) if c or k < 2))
 
     def export_spectrum(self):
         if self.shown is None:
@@ -614,6 +702,183 @@ class ScanResultsTab(QtWidgets.QWidget):
         self.hint.setText(f"Exported {acq.run.device} spectrum to {path}")
 
 
+class RecalibrateDialog(QtWidgets.QDialog):
+    """Fit a new linear calibration E = a + b*ch for one acquisition, from
+    peaks (channel -> known energy) or typed coefficients, and express it as
+    Target ECAL Offset/Slope on top of the file's calibration."""
+    LINES = ("Common lines (keV):  Na-22: 511, 1274.5   Cs-137: 661.7   Co-60: 1173.2, 1332.5\n"
+             "Eu-152: 121.8, 244.7, 344.3, 778.9, 964.1, 1085.8, 1112.1, 1408.0")
+
+    def __init__(self, acq, counts, n_same, parent=None):
+        super().__init__(parent)
+        self.acq, self.counts = acq, counts
+        self.is_reset = False
+        self.setWindowTitle(f"Recalibrate {acq.run.device}")
+        self.resize(560, 560)
+        c = acq.run.ecal
+        ea = acq.effective_ecal
+
+        info = QtWidgets.QLabel(
+            f"File calibration: E = {c[0]:.5g} + {c[1]:.5g}·ch"
+            + (f" + {c[2]:.3g}·ch²" if len(c) > 2 and c[2] else "")
+            + f"<br>Currently used: E = {ea[0]:.5g} + {ea[1]:.5g}·ch"
+            + "<br><br>Enter the channel of each peak you can identify and its known energy, "
+              "then press <b>Fit</b>. <b>Find Peaks</b> fills in the channels of the strongest "
+              "peaks (look at the spectrum: not every one is a real line)."
+            + ("<br><font color='#d9534f'>The file calibration has a quadratic term; only "
+               "its linear part is corrected (the quadratic term is scaled with it).</font>"
+               if len(c) > 2 and c[2] else ""))
+        info.setWordWrap(True)
+        lines = QtWidgets.QLabel(self.LINES)
+        lines.setStyleSheet("color: gray")
+
+        self.table = QtWidgets.QTableWidget(8, 3)
+        self.table.setHorizontalHeaderLabels(["Channel", "Energy (keV)", "Residual (keV)"])
+        self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        for r in range(8):
+            res = QtWidgets.QTableWidgetItem()
+            res.setFlags(res.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.table.setItem(r, 2, res)
+        find = QtWidgets.QPushButton("Find Peaks")
+        find.clicked.connect(self.find_peaks)
+        add = QtWidgets.QPushButton("Add Row")
+        add.clicked.connect(self.add_row)
+        fit = QtWidgets.QPushButton("Fit")
+        fit.clicked.connect(self.fit)
+        btns = QtWidgets.QHBoxLayout()
+        for b in (find, add, fit):
+            btns.addWidget(b)
+        btns.addStretch()
+
+        self.a = QtWidgets.QLineEdit(f"{ea[0]:.6g}")
+        self.b = QtWidgets.QLineEdit(f"{ea[1]:.6g}")
+        v = QtGui.QDoubleValidator()
+        for w in (self.a, self.b):
+            w.setValidator(v)
+            w.setMaximumWidth(110)
+        cal = QtWidgets.QHBoxLayout()
+        cal.addWidget(QtWidgets.QLabel("<b>New calibration:</b>  E ="))
+        cal.addWidget(self.a)
+        cal.addWidget(QtWidgets.QLabel("+"))
+        cal.addWidget(self.b)
+        cal.addWidget(QtWidgets.QLabel("× channel  (keV)"))
+        cal.addStretch()
+
+        self.msg = QtWidgets.QLabel()
+        self.msg.setWordWrap(True)
+        self.apply_all = QtWidgets.QCheckBox(
+            f"Apply to all {n_same} {acq.run.device} acquisitions with the same file calibration")
+        self.apply_all.setChecked(True)
+        self.apply_all.setVisible(n_same > 1)
+
+        box = QtWidgets.QDialogButtonBox()
+        ok = box.addButton("Apply", QtWidgets.QDialogButtonBox.AcceptRole)
+        reset = box.addButton("Reset to File Calibration", QtWidgets.QDialogButtonBox.ResetRole)
+        box.addButton(QtWidgets.QDialogButtonBox.Cancel)
+        ok.clicked.connect(self.try_accept)
+        reset.clicked.connect(self.reset)
+        box.rejected.connect(self.reject)
+
+        lay = QtWidgets.QVBoxLayout(self)
+        for w in (info, lines):
+            lay.addWidget(w)
+        lay.addLayout(btns)
+        lay.addWidget(self.table)
+        lay.addLayout(cal)
+        lay.addWidget(self.msg)
+        lay.addWidget(self.apply_all)
+        lay.addWidget(box)
+
+    def say(self, text, error=False):
+        self.msg.setText(f"<font color='#d9534f'>{text}</font>" if error else text)
+
+    def add_row(self):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        it = QtWidgets.QTableWidgetItem()
+        it.setFlags(it.flags() & ~QtCore.Qt.ItemIsEditable)
+        self.table.setItem(r, 2, it)
+
+    def find_peaks(self):
+        peaks = core.find_peaks(self.counts)
+        if not peaks:
+            self.say("No clear peaks found.", True)
+            return
+        while self.table.rowCount() < len(peaks):
+            self.add_row()
+        ec = self.acq.effective_ecal
+        for r in range(self.table.rowCount()):
+            for col in (0, 1, 2):
+                if self.table.item(r, col) is None:
+                    self.table.setItem(r, col, QtWidgets.QTableWidgetItem())
+                self.table.item(r, col).setText("")
+            if r < len(peaks):
+                self.table.item(r, 0).setText(f"{peaks[r]:.1f}")
+                self.table.item(r, 2).setText(f"now {ec[0] + ec[1] * peaks[r]:.0f} keV")
+        self.say(f"{len(peaks)} peaks found. Type the known energy next to the peaks you "
+                 "recognise (leave the others blank), then press Fit.")
+
+    def rows(self):
+        """[(row, channel, energy)] for rows with both values filled in."""
+        out = []
+        for r in range(self.table.rowCount()):
+            txt = [(self.table.item(r, c).text().strip() if self.table.item(r, c) else "")
+                   for c in (0, 1)]
+            if not all(txt):
+                continue
+            try:
+                out.append((r, float(txt[0]), float(txt[1])))
+            except ValueError:
+                raise ValueError(f"Row {r + 1}: channel and energy must be numbers")
+        return out
+
+    def fit(self):
+        try:
+            rows = self.rows()
+            a, b, res = core.fit_linear([x[1] for x in rows], [x[2] for x in rows])
+        except ValueError as e:
+            self.say(str(e), True)
+            return
+        for r in range(self.table.rowCount()):
+            self.table.item(r, 2).setText("")
+        for (r, _, _), d in zip(rows, res):
+            self.table.item(r, 2).setText(f"{d:+.2f}")
+        self.a.setText(f"{a:.6g}")
+        self.b.setText(f"{b:.6g}")
+        worst = np.abs(res).max()
+        self.say(f"Fit to {len(rows)} peaks: E = {a:.4g} + {b:.5g}·ch"
+                 + (f", largest residual {worst:.1f} keV." if len(rows) > 2 else
+                    ". Use 3 or more peaks to check the fit."),
+                 error=len(rows) > 2 and worst > 10)
+
+    def target_for(self, acq):
+        """Target Offset/Slope giving E = a + b*ch with acq's file calibration."""
+        if self.is_reset:
+            return {"offset": 0.0, "slope": 1.0}
+        a, b = float(self.a.text()), float(self.b.text())
+        c = acq.run.ecal
+        slope = b / c[1]
+        return {"offset": a - slope * c[0], "slope": slope}
+
+    def try_accept(self):
+        try:
+            a, b = float(self.a.text()), float(self.b.text())
+        except ValueError:
+            self.say("Enter numbers for the new calibration.", True)
+            return
+        if b <= 0:
+            self.say("The slope (keV per channel) must be positive.", True)
+            return
+        if not self.acq.run.ecal[1]:
+            self.say("The file calibration has zero slope and can't be corrected.", True)
+            return
+        self.accept()
+
+    def reset(self):
+        self.is_reset = True
+        self.accept()
+
+
 # ==========================================================================
 # Tab 3: Analysis
 # ==========================================================================
@@ -626,6 +891,8 @@ class AnalysisTab(QtWidgets.QWidget):
         self.scan_tab = scan_tab
         self.last = None             # (kind, data) of the last graph for export
         self.mode = None             # "1d" or "2d"
+        self.graphed = None          # (acq X, acq Y, X units, Y units) of the last graph
+        scan_tab.target_changed.connect(self.target_changed)
 
         self.fig = Figure(figsize=(10, 6), layout="constrained")
         self.canvas = FigureCanvasQTAgg(self.fig)
@@ -658,19 +925,37 @@ class AnalysisTab(QtWidgets.QWidget):
         l = QtWidgets.QLabel("Y Units:"); l.setStyleSheet(big)
         grid.addWidget(l, 1, 4)
         grid.addWidget(self.yunits, 1, 5)
+        # Optional bin widths (blank = auto: Target ECAL Bins / Time BINs)
+        self.width = [QtWidgets.QLineEdit(), QtWidgets.QLineEdit()]
+        self.width_unit = [QtWidgets.QLabel(), QtWidgets.QLabel()]
+        for k, (w, ul) in enumerate(zip(self.width, self.width_unit)):
+            w.setPlaceholderText("auto")
+            w.setFixedWidth(70)
+            w.setToolTip("Histogram bin width for this axis, in the axis units.\n"
+                         "Leave blank to use the Bins from Scan Results.")
+            l = QtWidgets.QLabel(f"{'XY'[k]} Bin Width:"); l.setStyleSheet(big)
+            grid.addWidget(l, k, 6)
+            row = QtWidgets.QHBoxLayout()
+            row.addWidget(w)
+            row.addWidget(ul)
+            grid.addLayout(row, k, 7)
+        self.xunits.currentTextChanged.connect(self.units_changed)
+        self.yunits.currentTextChanged.connect(self.units_changed)
+        self.units_changed()
         sep = QtWidgets.QFrame(); sep.setFrameShape(QtWidgets.QFrame.VLine)
-        grid.addWidget(sep, 0, 6, 3, 1)
+        grid.addWidget(sep, 0, 8, 3, 1)
         b_graph = QtWidgets.QPushButton("Graph")
         b_clear = QtWidgets.QPushButton("Clear Graph")
         b_export = QtWidgets.QPushButton("Export Data")
         b_graph.clicked.connect(self.graph)
         b_clear.clicked.connect(self.clear)
         b_export.clicked.connect(self.export)
-        grid.addWidget(b_graph, 0, 7)
-        grid.addWidget(b_clear, 1, 7)
-        grid.addWidget(b_export, 2, 7)
+        grid.addWidget(b_graph, 0, 9)
+        grid.addWidget(b_clear, 1, 9)
+        grid.addWidget(b_export, 2, 9)
         self.log = QtWidgets.QCheckBox("Log scale")
         self.log.setChecked(True)
+        self._warnings = []
         grid.addWidget(self.log, 2, 5)
         self.msg = QtWidgets.QLabel()
         grid.addWidget(self.msg, 2, 0, 1, 5)
@@ -717,9 +1002,32 @@ class AnalysisTab(QtWidgets.QWidget):
         box.setCurrentIndex(idx if idx >= 0 else (0 if box.count() == 1 else -1))
         box.blockSignals(False)
 
+    def target_changed(self, acqs):
+        """A Target ECAL (calibration, range or bins) changed on Scan Results:
+        redraw the current plot if it uses one of those acquisitions."""
+        if self.graphed is None or self.mode is None:
+            return
+        a0, a1, xu, yu = self.graphed
+        used = ([] if xu == UNIT_DT else [a0]) + ([] if yu == UNIT_COUNTS else [a1])
+        if not any(a in acqs for a in used):
+            return
+        same = (self.start[0].currentData() is a0 and self.start[1].currentData() is a1
+                and self.xunits.currentText() == xu and self.yunits.currentText() == yu)
+        if self.mode == "2d" and same:
+            self.graph()
+            self.msg.setText(self.msg.text() + "<br><i>Redrawn with the new Target ECAL.</i>")
+        else:   # 1D plots overlay, so redrawing would duplicate a curve
+            self.say("Target ECAL changed since this plot was drawn: press Clear Graph, "
+                     "then Graph, to use it.", True)
+
     # ---------------------------------------------------------------- graph
     def say(self, text, error=False):
-        self.msg.setText(f"<font color='red'>{text}</font>" if error else text)
+        if error:
+            text = f"<font color='red'>{text}</font>"
+        elif self._warnings:
+            text += "".join(f"<br><font color='#d9534f'>⚠ {html.escape(w)}</font>"
+                            for w in self._warnings)
+        self.msg.setText(text)
 
     def clear(self):
         self.fig.clear()
@@ -729,14 +1037,53 @@ class AnalysisTab(QtWidgets.QWidget):
         self.last = None
         self.canvas.draw_idle()
 
-    def _axis(self, acq, ev, units):
+    UNIT_SUFFIX = {UNIT_ENERGY: "keV", UNIT_CHANNEL: "channels", UNIT_DT: "ns", UNIT_COUNTS: ""}
+    MAX_BINS = 20000
+
+    def units_changed(self, *_):
+        for k, units in enumerate((self.xunits.currentText(), self.yunits.currentText())):
+            self.width_unit[k].setText(self.UNIT_SUFFIX[units])
+            self.width[k].setEnabled(units != UNIT_COUNTS)
+
+    def bin_width(self, k):
+        """Bin width typed for axis k (0 = X, 1 = Y), or None for auto."""
+        txt = self.width[k].text().strip()
+        if not txt or not self.width[k].isEnabled():
+            return None
+        try:
+            w = float(txt)
+        except ValueError:
+            raise ValueError(f"{'XY'[k]} Bin Width must be a number (or blank for auto)")
+        if not w > 0:
+            raise ValueError(f"{'XY'[k]} Bin Width must be greater than zero")
+        return w
+
+    @classmethod
+    def _edges(cls, lo, hi, bins, width):
+        """Bin edges from lo to hi: `bins` equal bins, or bins of `width`."""
+        if width is None:
+            return np.linspace(lo, hi, bins + 1)
+        return core.edges_for_width(lo, hi, width, cls.MAX_BINS)
+
+    def _axis(self, acq, ev, units, width=None):
         """Values and bin edges for a device axis in the requested units."""
         t = acq.target
         if units == UNIT_CHANNEL:
             n = max(acq.n_channels, int(ev.channel.max()) + 1 if len(ev.channel) else 1)
-            return ev.channel.astype(float), np.linspace(0, n, min(t["bins"], n) + 1)
+            edges = (np.linspace(0, n, min(t["bins"], n) + 1) if width is None
+                     else self._edges(0, n, 0, max(1, round(width))))
+            return ev.channel.astype(float), edges
         vals = t["offset"] + t["slope"] * ev.energy
-        return vals, np.linspace(t["low"], t["high"], t["bins"] + 1)
+        return vals, self._edges(t["low"], t["high"], t["bins"], width)
+
+    @staticmethod
+    def _comb_note(acq, units, edges):
+        """Red note if energy bins aren't a whole number of ADC channels."""
+        if units != UNIT_ENERGY or len(edges) < 2:
+            return ""
+        note = core.comb_note(acq.run.device, edges[1] - edges[0],
+                              acq.target["slope"] * acq.run.ecal[1])
+        return f"<br><font color='#d9534f'>{note}</font>" if note else ""
 
     def graph(self):
         acq = [self.start[i].currentData() for i in range(2)]
@@ -746,22 +1093,25 @@ class AnalysisTab(QtWidgets.QWidget):
         if acq[0] is acq[1]:
             self.say("Choose two different devices / acquisitions.", True)
             return
+        self._warnings = self.store.warnings(only=acq)
         xu, yu = self.xunits.currentText(), self.yunits.currentText()
         if xu == UNIT_DT and yu != UNIT_COUNTS:
             self.say("With X = Delta Time, choose Y Units = Counts.", True)
             return
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
             t_lo, t_hi, t_bins = self.scan_tab.time_settings()
             gate = self.scan_tab.gate_settings()
+            wx, wy = self.bin_width(0), self.bin_width(1)
+            ea, eb = self.store.events(acq[0]), self.store.events(acq[1])
+            t_edges = self._edges(t_lo, t_hi, t_bins, wx if xu == UNIT_DT else None)
+            xa = None if xu == UNIT_DT else self._axis(acq[0], ea, xu, wx)
+            ya = None if yu == UNIT_COUNTS else self._axis(acq[1], eb, yu, wy)
+            w_lo, w_hi = (min(t_lo, gate[0]), max(t_hi, gate[1])) if gate else (t_lo, t_hi)
+            i_all, j_all, dt_all = core.coincidence_pairs(ea.t_ns, eb.t_ns, w_lo, w_hi)
         except ValueError as e:
             self.say(str(e), True)
             return
-
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
-        try:
-            ea, eb = self.store.events(acq[0]), self.store.events(acq[1])
-            w_lo, w_hi = (min(t_lo, gate[0]), max(t_hi, gate[1])) if gate else (t_lo, t_hi)
-            i_all, j_all, dt_all = core.coincidence_pairs(ea.t_ns, eb.t_ns, w_lo, w_hi)
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
         # Delta-time plots: the whole Time Range.  Energy/channel plots: the gate.
@@ -773,17 +1123,24 @@ class AnalysisTab(QtWidgets.QWidget):
         gate_txt = f" (gate {g_lo:g} to {g_hi:g} ns)" if gate else ""
         da, db = acq[0].run.device, acq[1].run.device
         log = self.log.isChecked()
+        notes = ((self._comb_note(acq[0], xu, xa[1]) if xa else "")
+                 + (self._comb_note(acq[1], yu, ya[1]) if ya else ""))
+        tb = acq[0].run.timebase_ns
+        if xu == UNIT_DT and wx and abs(wx / tb - round(wx / tb)) > 1e-6:
+            notes += (f"<br><font color='#d9534f'>Δt bins of {wx:g} ns aren't a multiple of the "
+                      f"{tb:g} ns clock: expect stripes.</font>")
 
+        self.graphed = (acq[0], acq[1], xu, yu)
         if yu == UNIT_COUNTS:
             if xu == UNIT_DT:
-                edges = np.linspace(t_lo, t_hi, t_bins + 1)
+                edges = t_edges
                 counts, _ = np.histogram(dt, edges)
                 label = f"{da} - {db}"
                 xlabel = "Δ Time (ns)"
                 header = "deltaTime, counts"
                 plot_gate = gate
             else:
-                vals, edges = self._axis(acq[0], ea, xu)
+                vals, edges = xa
                 counts, _ = np.histogram(vals[i], edges)
                 label = f"{da} (coincident with {db})"
                 xlabel = f"{xu.split(' ')[0]} {da}" + (" (keV)" if xu == UNIT_ENERGY else "")
@@ -793,18 +1150,18 @@ class AnalysisTab(QtWidgets.QWidget):
             self.plot_1d(edges, counts, label, xlabel, log, plot_gate)
             self.last = ("1d", header, edges[:-1], counts)
             self.say(f"{int(counts.sum()):,} coincident events plotted"
-                     f"{'' if xu == UNIT_DT else gate_txt}.")
+                     f"{'' if xu == UNIT_DT else gate_txt}." + notes)
             return
 
         # 2D: X = device 1 (or delta time), Y = device 2
-        yv, yedges = self._axis(acq[1], eb, yu)
+        yv, yedges = ya
         if xu == UNIT_DT:
-            xv, xedges = dt, np.linspace(t_lo, t_hi, t_bins + 1)
+            xv, xedges = dt, t_edges
             j = j_all[in_range]
             xlabel = "Δ Time (ns)"
             xcol = "deltaTime"
         else:
-            xv, xedges = self._axis(acq[0], ea, xu)
+            xv, xedges = xa
             xv = xv[i]
             xlabel = f"{'Energy' if xu == UNIT_ENERGY else 'Channel'} {da}" + \
                      (" (keV)" if xu == UNIT_ENERGY else "")
@@ -815,10 +1172,10 @@ class AnalysisTab(QtWidgets.QWidget):
         self.plot_2d(xedges, yedges, h, xlabel, ylabel, log)
         self.last = ("2d", f"{xcol}, {db}, counts", xedges[:-1], yedges[:-1], h.astype(np.int64))
         self.say(f"{int(h.sum()):,} coincident events plotted"
-                 f"{'' if xu == UNIT_DT else gate_txt}.")
+                 f"{'' if xu == UNIT_DT else gate_txt}." + notes)
 
         if xu != UNIT_DT:          # energy/channel matrix: hand it to the Projections tab
-            t_edges = np.linspace(t_lo, t_hi, t_bins + 1)
+            t_edges = np.linspace(t_lo, t_hi, t_bins + 1)       # Scan Results Time BINs
             res = core.Result(
                 a=self._target_events(acq[0], ea), b=self._target_events(acq[1], eb),
                 units_a=self._core_units(xu), units_b=self._core_units(yu),
