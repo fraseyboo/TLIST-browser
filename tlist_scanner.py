@@ -475,6 +475,11 @@ class ScanResultsTab(QtWidgets.QWidget):
 
         self.spectrum = SpectrumCanvas()
         self.hint = QtWidgets.QLabel("Click a device name to display its energy spectrum.")
+        self.shown = None            # (Acquisition, counts) of the displayed spectrum
+        self.export_btn = QtWidgets.QPushButton("Export Spectrum")
+        self.export_btn.setToolTip("Save the displayed spectrum: channel, energy, counts")
+        self.export_btn.setEnabled(False)
+        self.export_btn.clicked.connect(self.export_spectrum)
 
         top = QtWidgets.QWidget()
         tl = QtWidgets.QVBoxLayout(top)
@@ -485,7 +490,10 @@ class ScanResultsTab(QtWidgets.QWidget):
         bottom = QtWidgets.QWidget()
         bl = QtWidgets.QVBoxLayout(bottom)
         bl.setContentsMargins(0, 0, 0, 0)
-        bl.addWidget(self.hint)
+        hint_row = QtWidgets.QHBoxLayout()
+        hint_row.addWidget(self.hint, 1)
+        hint_row.addWidget(self.export_btn)
+        bl.addLayout(hint_row)
         bl.addWidget(NavigationToolbar2QT(self.spectrum, self))
         bl.addWidget(self.spectrum)
         split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
@@ -589,6 +597,21 @@ class ScanResultsTab(QtWidgets.QWidget):
         self.hint.setText(f"{acq.run.device}  (start {fmt_time(acq.run.start_ms)}): "
                           f"{len(ev.t_ns):,} events, {n} channels")
         self.spectrum.show_spectrum(acq.run.device, counts, acq.run.ecal)
+        self.shown = (acq, counts)
+        self.export_btn.setEnabled(True)
+
+    def export_spectrum(self):
+        if self.shown is None:
+            return
+        acq, counts = self.shown
+        stamp = datetime.fromtimestamp(acq.run.start_ms / 1000).strftime("%Y%m%d_%H%M%S")
+        name = f"{acq.run.device}_{stamp}_spectrum.txt"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export Spectrum", name, "Text (*.txt *.csv)")
+        if not path:
+            return
+        core.export_channel_spectrum(path, acq.run, counts)
+        self.hint.setText(f"Exported {acq.run.device} spectrum to {path}")
 
 
 # ==========================================================================

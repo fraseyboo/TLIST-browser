@@ -417,6 +417,47 @@ def channel_edges(run: Run, units: str, lo: float, hi: float, group: int = 1):
     return e[(e >= lo - abs(c[1]) * group) & (e <= hi + abs(c[1]) * group)]
 
 
+def singles(ev: EventData, units: str, lo=None, hi=None, group: int = 1):
+    """Ungated 1D spectrum of one detector (every event, no coincidence test).
+
+    Bins follow the detector's channel boundaries, `group` channels per bin.
+    lo/hi default to the full range of the data. Returns (edges, counts).
+    """
+    v = ev.values(units)
+    if lo is None or hi is None:
+        if len(v) == 0:
+            return np.array([0.0, 1.0]), np.zeros(1, np.int64)
+        lo = v.min() if lo is None else lo
+        hi = v.max() if hi is None else hi
+    edges = channel_edges(ev.run, units, lo, hi, group)
+    if len(edges) < 2:
+        return np.array([lo, hi], float), np.zeros(1, np.int64)
+    counts, _ = np.histogram(v, bins=edges)
+    return edges, counts
+
+
+def export_singles(path, spectra, units):
+    """spectra: [(EventData, edges, counts)]. One block per detector."""
+    with open(path, "w") as fh:
+        fh.write(f"# Singles spectra (no coincidence gating), {_ulabel(units)}\n")
+        fh.write(f"device, start_utc, {_ulabel(units)}_low, {_ulabel(units)}_high, counts\n")
+        for ev, edges, counts in spectra:
+            for l, h, c in zip(edges[:-1], edges[1:], counts):
+                fh.write(f"{ev.run.device}, {ev.run.start_str}, {l:g}, {h:g}, {c}\n")
+
+
+def export_channel_spectrum(path, run: Run, counts):
+    """Full per-channel singles spectrum: channel, energy (channel centre), counts."""
+    c = list(run.ecal) + [0.0, 0.0]
+    with open(path, "w") as fh:
+        fh.write(f"# Singles spectrum (no coincidence gating): {run.device} ({run.ip}), "
+                 f"start {run.start_str} UTC, {int(counts.sum())} events\n")
+        fh.write(f"# ECAL: E = {c[0]!r} + {c[1]!r}*ch + {c[2]!r}*ch^2 keV\n")
+        fh.write("channel, energy_keV, counts\n")
+        for ch, n in enumerate(counts):
+            fh.write(f"{ch}, {c[0] + c[1] * ch + c[2] * ch * ch:.4f}, {n}\n")
+
+
 def export_projection(path, res: Result, gate_axis, lo, hi, edges, counts):
     ga, pa = (res.a, res.b) if gate_axis == "a" else (res.b, res.a)
     ug, up = (res.units_a, res.units_b) if gate_axis == "a" else (res.units_b, res.units_a)

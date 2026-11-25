@@ -217,3 +217,177 @@ class ProjectionTab(QtWidgets.QWidget):
             core.export_projection(path, self.res, self.gate_axis(), self.lo.value(),
                                    self.hi.value(), edges, counts)
             self.status(f"Wrote {path}")
+
+
+class SinglesTab(QtWidgets.QWidget):
+    """Singles mode: the ungated 1D spectrum of each detector.
+
+    Every event counts, with no coincidence test. One acquisition per device
+    is offered (the owner picks which, e.g. the one matching Device A's run).
+    `load(runs, then)` must make the runs' EventData available and call
+    then({run.key: EventData}).
+    """
+
+    def __init__(self, status, load):
+        super().__init__()
+        self.status, self.load = status, load
+        self.runs = []              # one Run per device
+        self.data = {}              # run.key -> EventData of the last plot
+        self.spectra = []           # [(EventData, edges, counts)] last drawn
+        self.checks = {}            # run.key -> QCheckBox
+
+        self.dev_row = QtWidgets.QHBoxLayout()
+        self.dev_row.addWidget(QtWidgets.QLabel("Detectors"))
+        self.dev_row.addStretch(1)
+
+        self.units = QtWidgets.QComboBox()
+        self.units.addItems(["energy", "channel"])
+        self.full = QtWidgets.QCheckBox("Full range")
+        self.full.setChecked(True)
+        self.lo = _spin(-1e6, 1e6, 0, 1, 10)
+        self.hi = _spin(-1e6, 1e6, 4000, 1, 10)
+        self.group = _spin(1, 10000, 1)
+        self.group.setToolTip("Bins follow each detector's own channel boundaries "
+                              "(avoids a comb pattern); this sets channels per bin.")
+        self.mode = QtWidgets.QComboBox()
+        self.mode.addItems(["Overlay", "One panel per detector"])
+        self.rate = QtWidgets.QCheckBox("Counts / s")
+        self.rate.setToolTip("Divide by each run's duration, to compare detectors")
+        self.log = QtWidgets.QCheckBox("Log scale")
+        self.log.setChecked(True)
+        plot = QtWidgets.QPushButton("Plot singles")
+        plot.clicked.connect(self.plot)
+        export = QtWidgets.QPushButton("Export…")
+        export.clicked.connect(self.export)
+
+        grid = QtWidgets.QGridLayout()
+        grid.addLayout(self.dev_row, 0, 0, 1, 9)
+        for col, (name, w) in enumerate([("Units", self.units), ("Low", self.lo),
+                                          ("High", self.hi), ("Channels / bin", self.group),
+                                          ("Layout", self.mode)]):
+            grid.addWidget(QtWidgets.QLabel(name), 1, 2 * col)
+            grid.addWidget(w, 1, 2 * col + 1)
+        row2 = QtWidgets.QHBoxLayout()
+        for w in (self.full, self.rate, self.log):
+            row2.addWidget(w)
+        row2.addStretch(1)
+        row2.addWidget(plot)
+        row2.addWidget(export)
+        grid.addLayout(row2, 2, 0, 1, 10)
+
+        self.fig = Figure(figsize=(10, 6), layout="constrained")
+        self.canvas = FigureCanvasQTAgg(self.fig)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.addLayout(grid)
+        lay.addWidget(NavigationToolbar2QT(self.canvas, self))
+        lay.addWidget(self.canvas, 1)
+
+        self.full.toggled.connect(self.range_mode)
+        for w in (self.lo, self.hi, self.group):
+            w.valueChanged.connect(self.redraw)
+        for w in (self.units, self.mode):
+            w.currentIndexChanged.connect(self.redraw)
+        for w in (self.full, self.rate, self.log):
+            w.toggled.connect(self.redraw)
+        self.range_mode(True)
+
+    # ------------------------------------------------------------ state
+    def set_runs(self, runs):
+        """Offer these runs (one per device). Keeps ticks for devices seen before."""
+        ticked = {r.device for r in self.runs if self.checks[r.key].isChecked()}
+        known = {r.device for r in self.runs}
+        for cb in self.checks.values():
+            self.dev_row.removeWidget(cb)
+            cb.deleteLater()
+        self.checks = {}
+        self.runs = list(runs)
+        for k, r in enumerate(self.runs):
+            cb = QtWidgets.QCheckBox(f"{r.device}  ({r.start_str}, {len(r.files)} files)")
+            cb.setChecked(r.device in ticked or r.device not in known)
+            cb.toggled.connect(self.redraw)
+            self.checks[r.key] = cb
+            self.dev_row.insertWidget(1 + k, cb)
+        self.data = {k: v for k, v in self.data.items() if k in self.checks}
+        self.redraw()
+
+    def selected(self):
+        return [r for r in self.runs if self.checks[r.key].isChecked()]
+
+    def range_mode(self, full):
+        self.lo.setEnabled(not full)
+        self.hi.setEnabled(not full)
+
+    # ------------------------------------------------------------ actions
+    def plot(self):
+        runs = self.selected()
+        if not runs:
+            self.status("Tick at least one detector")
+            return
+
+        def loaded(data):
+            self.data.update(data)
+            self.redraw()
+        self.load(runs, loaded)
+
+    def redraw(self, *_):
+        runs = [r for r in self.selected() if r.key in self.data]
+        if not runs:
+            return
+        units = self.units.currentText()
+        if self.full.isChecked():
+            lo = hi = None
+        else:
+            lo, hi = self.lo.value(), self.hi.value()
+            if hi <= lo:
+                self.status("Singles: high must exceed low")
+                return
+        self.spectra = []
+        for r in runs:
+            ev = self.data[r.key]
+            edges, counts = core.singles(ev, units, lo, hi, self.group.value())
+            self.spectra.append((ev, edges, counts))
+
+        rate, log = self.rate.isChecked(), self.log.isChecked()
+        uname = "keV" if units == "energy" else "ch"
+        self.fig.clear()
+        n = len(self.spectra)
+        panels = self.mode.currentIndex() == 1
+        # channel scales differ between detectors, so only share x in energy
+        share = units == "energy" or not panels
+        axes = (self.fig.subplots(n, 1, sharex=share, squeeze=False)[:, 0]
+                if panels else [self.fig.add_subplot()] * n)
+        for k, (ax, (ev, edges, counts)) in enumerate(zip(axes, self.spectra)):
+            dur = ev.duration_s
+            y = counts / dur if rate and dur > 0 else counts
+            width = edges[1] - edges[0]
+            ax.stairs(y, edges, color=f"C{k}", lw=1.1,
+                      label=f"{ev.run.device}: {len(ev.t_ns):,} events, {dur:.1f} s, "
+                            f"{width:.3g} {uname}/bin")
+            if log:
+                ax.set_yscale("log")
+                if not rate:
+                    ax.set_ylim(bottom=0.8)
+            ax.set_ylabel(("Counts / s" if rate else "Counts") + " per bin")
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc="upper right")
+            if not share:
+                ax.set_xlim(edges[0], edges[-1])
+                ax.set_xlabel("Channel")
+        if share:
+            xs = np.concatenate([e for _, e, _ in self.spectra])
+            axes[-1].set_xlim(xs.min(), xs.max())
+            axes[-1].set_xlabel("Energy (keV)" if units == "energy" else "Channel")
+        axes[0].set_title("Singles spectra (no coincidence gating)")
+        self.canvas.draw_idle()
+        self.status(f"Singles: {', '.join(f'{ev.run.device} {int(c.sum()):,}' for ev, _, c in self.spectra)}"
+                    " counts in range")
+
+    def export(self):
+        if not self.spectra:
+            self.status("Nothing to export - press Plot singles first")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export singles", "singles.csv", "CSV (*.csv)")
+        if path:
+            core.export_singles(path, self.spectra, self.units.currentText())
+            self.status(f"Wrote {path}")

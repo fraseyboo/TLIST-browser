@@ -15,7 +15,7 @@ from matplotlib.figure import Figure
 
 import tlist_core as core
 import tlist_plot
-from tlist_widgets import ProjectionTab, _spin
+from tlist_widgets import ProjectionTab, SinglesTab, _spin
 
 
 class Loader(QtCore.QThread):
@@ -152,6 +152,8 @@ class Main(QtWidgets.QMainWindow):
         self.tabs.addTab(self.dt_tab, "Delta time")
         self.proj_tab = ProjectionTab(self.status)
         self.tabs.addTab(self.proj_tab, "Projections")
+        self.singles_tab = SinglesTab(self.status, self.load_runs)
+        self.tabs.addTab(self.singles_tab, "Singles")
 
         split = QtWidgets.QSplitter()
         split.addWidget(scroll)
@@ -209,6 +211,8 @@ class Main(QtWidgets.QMainWindow):
             box.setCurrentIndex(min(i, len(devs) - 1))
             box.blockSignals(False)
             self.fill_runs(ab)
+        self.singles_tab.data = {}
+        self.offer_singles()
         self.status(f"Found {len(runs)} acquisitions from {len(devs)} devices")
 
     def fill_runs(self, ab):
@@ -229,16 +233,22 @@ class Main(QtWidgets.QMainWindow):
             return
         best = min(range(boxb.count()), key=lambda i: abs(boxb.itemData(i).start_ms - ra.start_ms))
         boxb.setCurrentIndex(best)
+        self.offer_singles()
 
-    def units_changed(self):
-        self.replot_if_loaded()
-
-    def graph(self):
-        ra, rb = self.run_box["A"].currentData(), self.run_box["B"].currentData()
-        if ra is None or rb is None:
-            self.status("Select two acquisitions first")
+    def offer_singles(self):
+        """Singles tab: for every device, the run closest in start to A's run."""
+        ra = self.run_box["A"].currentData()
+        if ra is None:
             return
-        need = [r for r in (ra, rb) if r.key not in self.cache]
+        runs = [min((r for r in self.runs if r.device == d),
+                    key=lambda r: abs(r.start_ms - ra.start_ms))
+                for d in core.devices(self.runs)]
+        self.singles_tab.set_runs(runs)
+
+    def load_runs(self, runs, then):
+        """Load any runs not yet cached (in the background), then call
+        then({run.key: EventData}) for all of them."""
+        need = [r for r in runs if r.key not in self.cache]
 
         def job(progress, need):
             out = {}
@@ -249,11 +259,23 @@ class Main(QtWidgets.QMainWindow):
 
         def loaded(out):
             self.cache.update(out)
-            self.compute(ra, rb)
-        if need:
-            self.start(job, (need,), loaded)
+            then({r.key: self.cache[r.key] for r in runs})
+        if not need:
+            loaded({})
+        elif self.busy():
+            self.status("Busy loading - try again in a moment")
         else:
-            self.compute(ra, rb)
+            self.start(job, (need,), loaded)
+
+    def units_changed(self):
+        self.replot_if_loaded()
+
+    def graph(self):
+        ra, rb = self.run_box["A"].currentData(), self.run_box["B"].currentData()
+        if ra is None or rb is None:
+            self.status("Select two acquisitions first")
+            return
+        self.load_runs([ra, rb], lambda _data: self.compute(ra, rb))
 
     def replot_if_loaded(self, *_):
         ra, rb = self.run_box["A"].currentData(), self.run_box["B"].currentData()

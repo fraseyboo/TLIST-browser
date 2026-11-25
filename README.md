@@ -62,6 +62,15 @@ projected detector's channel boundaries (set *Channels / bin*), which avoids a
 comb pattern. The grey curve is the ungated projection for comparison.
 *Export projection…* writes a CSV.
 
+**Singles tab**: treats the data as singles, with no coincidence test: one
+ungated 1D spectrum per detector, counting every event. For each device it
+offers the acquisition closest in start time to Device A's; tick the detectors
+and press *Plot singles* (loading any run not already cached). Choose energy
+or channel units, *Full range* or a Low/High window, channels per bin (each
+detector is binned on its own channel boundaries), *Overlay* or *One panel per
+detector*, and *Counts / s* to compare detectors normalised by run duration.
+*Export…* writes one CSV with a block per detector.
+
 ## Training version (follows the lab manual)
 
 ```sh
@@ -80,6 +89,8 @@ existing lab manual can be followed step by step:
    source ECAL from the files, editable Target ECAL), plus the *Time
    Calibration* range and bins. Click a **device name** to show its ungated
    singles spectrum; hover to read channel, energy and counts.
+   *Export Spectrum* saves the displayed spectrum as text, one row per
+   channel: channel, energy (keV), counts.
    The optional **Coincidence Gate (ns)** (off by default; e.g. −800 to 0)
    restricts Energy/Channel plots and Projections to pairs inside the gate,
    while Delta Time plots keep the full Time Range and show the gate as
@@ -126,4 +137,4 @@ docstring of `tlist_core.py`. In short:
 * `tlist_cli.py`: command line
 * `tlist_gui.py`: PyQt5 GUI (compact, all settings on one panel)
 * `tlist_scanner.py`: PyQt5 GUI matching the old scanner / lab manual
-* `tlist_widgets.py`: the Projections widget shared by both GUIs
+* `tlist_widgets.py`: the Projections widget shared by both GUIs, and the Singles tab
