@@ -38,6 +38,7 @@ from matplotlib.colors import LogNorm
 from matplotlib.figure import Figure
 
 import tlist_core as core
+import tlist_plot
 from tlist_widgets import ProjectionTab
 
 LOW_E_CHECK_KEV = 100.0      # Scan Results spectrum warns if nothing is below this energy
@@ -1226,6 +1227,7 @@ class AnalysisTab(QtWidgets.QWidget):
         norm = LogNorm(vmin=1, vmax=vmax) if log else None
         m = ax.pcolormesh(xedges, yedges, hm, cmap="turbo", norm=norm, shading="flat")
         self.fig.colorbar(m, ax=ax, label="Counts")
+        tlist_plot.add_bin_readout(ax, xedges, yedges, h)   # hover shows the bin's counts
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
         ax.grid(True, color="k", lw=0.6, alpha=0.5)

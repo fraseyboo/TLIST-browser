@@ -66,7 +66,12 @@ The slice is shaded on the 2D plot and the projection updates live. Cuts use
 each pair's exact energy, not the 2D bins. Projection bins follow the
 projected detector's channel boundaries (set *Channels / bin*), which avoids a
 comb pattern. The grey curve is the ungated projection for comparison.
-*Export projection…* writes a CSV.
+*Export projection…* writes a CSV. *Log scale* switches the projection's y axis
+between log and linear.
+
+On any 2D histogram (Energy vs Energy, the Projections matrix and the training
+version's Analysis matrix), the toolbar read-out at the top right shows the
+count in the bin under the mouse, with that bin's edges.
 
 **Singles tab**: treats the data as singles, with no coincidence test: one
 ungated 1D spectrum per detector, counting every event. For each device it

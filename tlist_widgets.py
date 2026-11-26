@@ -63,6 +63,11 @@ class ProjectionTab(QtWidgets.QWidget):
         self.show_total = QtWidgets.QCheckBox("Show ungated projection")
         self.show_total.setChecked(True)
         self.show_total.toggled.connect(self.update_slice)
+        self.log_proj = QtWidgets.QCheckBox("Log scale")
+        self.log_proj.setToolTip("Log y axis for the projection (the 2D plot keeps the "
+                                 "Analysis setting)")
+        self.log_proj.setChecked(True)
+        self.log_proj.toggled.connect(self.update_slice)
         export = QtWidgets.QPushButton("Export projection…")
         export.clicked.connect(self.export)
 
@@ -71,7 +76,10 @@ class ProjectionTab(QtWidgets.QWidget):
         grid.addWidget(self.axis, 0, 1, 1, 2)
         grid.addWidget(QtWidgets.QLabel("Channels / bin"), 0, 3)
         grid.addWidget(self.bins, 0, 4)
-        grid.addWidget(self.show_total, 0, 5)
+        opts = QtWidgets.QHBoxLayout()
+        opts.addWidget(self.show_total)
+        opts.addWidget(self.log_proj)
+        grid.addLayout(opts, 0, 5)
         grid.addWidget(export, 0, 6)
         self.unit_lbl = []
         for row, (name, slider, spin, name2, spin2) in enumerate(
@@ -195,9 +203,11 @@ class ProjectionTab(QtWidgets.QWidget):
                     label="Ungated (all pairs)")
         ax.step(edges, np.append(counts, counts[-1]), where="post", color="C3", lw=1.3,
                 label=f"{gdev.run.device} in [{lo:g}, {hi:g}) {uname(ug)}")
-        if self.log:
+        if self.log_proj.isChecked():
             ax.set_yscale("log")
             ax.set_ylim(bottom=0.8)
+        else:
+            ax.set_ylim(bottom=0)
         ax.set_xlim(edges[0], edges[-1])
         ax.set_xlabel(f"{pdev.run.device} {'Energy (keV)' if up == 'energy' else 'Channel'}")
         ax.set_ylabel(f"Counts / {edges[1] - edges[0]:.3g} {uname(up)}")

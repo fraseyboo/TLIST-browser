@@ -8,6 +8,23 @@ def _ulabel(u):
     return "Energy (keV)" if u == "energy" else "Channel"
 
 
+def add_bin_readout(ax, xedges, yedges, counts):
+    """Make the toolbar's cursor read-out show the 2D histogram bin under the
+    mouse and its count, not just the (x, y) position.  counts[i, j] is the
+    bin xedges[i]..xedges[i+1], yedges[j]..yedges[j+1]."""
+    xedges, yedges = np.asarray(xedges), np.asarray(yedges)
+
+    def fmt(x, y):
+        pos = f"x={x:.5g}  y={y:.5g}"
+        i = np.searchsorted(xedges, x, "right") - 1
+        j = np.searchsorted(yedges, y, "right") - 1
+        if 0 <= i < counts.shape[0] and 0 <= j < counts.shape[1]:
+            return (f"counts = {int(counts[i, j]):,}   in x [{xedges[i]:.5g}, {xedges[i + 1]:.5g}) "
+                    f"× y [{yedges[j]:.5g}, {yedges[j + 1]:.5g})   ({pos})")
+        return pos
+    ax.format_coord = fmt
+
+
 def draw_energy_energy(ax, res, log=True, cmap="turbo"):
     """2D histogram: x = device A, y = device B. Returns the mappable."""
     h = np.ma.masked_equal(res.ee_counts.T, 0)
@@ -21,6 +38,7 @@ def draw_energy_energy(ax, res, log=True, cmap="turbo"):
     ax.set_xlim(res.ea_edges[0], res.ea_edges[-1])
     ax.set_ylim(res.eb_edges[0], res.eb_edges[-1])
     ax.set_facecolor("white")
+    add_bin_readout(ax, res.ea_edges, res.eb_edges, res.ee_counts)
     return m
 
 
