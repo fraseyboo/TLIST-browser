@@ -82,6 +82,12 @@ detector is binned on its own channel boundaries), *Overlay* or *One panel per
 detector*, and *Counts / s* to compare detectors normalised by run duration.
 *Export…* writes one CSV with a block per detector.
 
+**Dark mode**: *View → Dark Mode* (Ctrl+Shift+D) in either GUI switches the
+widgets and every plot between light and dark. The choice is remembered for
+next time. Saving a figure from the plot toolbar saves it as it looks on
+screen, so switch back to light mode for figures you want on a white
+background.
+
 ## Training version (follows the lab manual)
 
 ```sh
@@ -182,3 +188,4 @@ Directories and under the plot on Analysis.
 * `tlist_gui.py`: PyQt5 GUI (compact, all settings on one panel)
 * `tlist_scanner.py`: PyQt5 GUI matching the old scanner / lab manual
 * `tlist_widgets.py`: the Projections widget shared by both GUIs, and the Singles tab
+* `tlist_theme.py`: light/dark theme for both GUIs (View → Dark Mode)

@@ -3,7 +3,7 @@
 import numpy as np
 from PyQt5 import QtCore, QtWidgets
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT
-from matplotlib.figure import Figure
+from tlist_theme import ThemedFigure as Figure
 
 import tlist_core as core
 import tlist_plot

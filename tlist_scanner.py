@@ -35,10 +35,11 @@ import matplotlib
 matplotlib.use("Qt5Agg")
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.colors import LogNorm
-from matplotlib.figure import Figure
+from tlist_theme import ThemedFigure as Figure
 
 import tlist_core as core
 import tlist_plot
+import tlist_theme
 from tlist_widgets import ProjectionTab
 
 LOW_E_CHECK_KEV = 100.0      # Scan Results spectrum warns if nothing is below this energy
@@ -1305,6 +1306,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tabs.addTab(self.projections, "Projections")
         self.setCentralWidget(tabs)
         self.tabs = tabs
+        tlist_theme.add_menu(self)
         for d in directories:
             self.search.add_path(os.path.abspath(d))
 

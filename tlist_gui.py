@@ -12,10 +12,11 @@ from PyQt5 import QtCore, QtWidgets
 import matplotlib
 matplotlib.use("Qt5Agg")
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT
-from matplotlib.figure import Figure
+from tlist_theme import ThemedFigure as Figure
 
 import tlist_core as core
 import tlist_plot
+import tlist_theme
 from tlist_widgets import ProjectionTab, SinglesTab, _spin
 
 
@@ -170,6 +171,8 @@ class Main(QtWidgets.QMainWindow):
         split.addWidget(self.tabs)
         split.setStretchFactor(1, 1)
         self.setCentralWidget(split)
+
+        tlist_theme.add_menu(self)
 
         if directory:
             QtCore.QTimer.singleShot(0, self.scan)
